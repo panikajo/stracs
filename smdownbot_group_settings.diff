@@ -1,0 +1,1084 @@
+diff --git a/bot.py b/bot.py
+index 13f93cf..e999531 100644
+--- a/bot.py
++++ b/bot.py
+@@ -11,7 +11,7 @@ from aiogram.enums import ParseMode
+ 
+ from config import config
+ from database.models import init_db
+-from handlers import start, download, admin, stars
++from handlers import start, download, admin, stars, settings, groups
+ from services.i18n import t, LANGUAGES
+ 
+ logging.basicConfig(
+@@ -65,6 +65,8 @@ async def set_bot_commands(bot: Bot):
+             BotCommand(command="stats", description=t(lang, "cmd_stats")),
+             BotCommand(command="buy", description=t(lang, "cmd_buy")),
+             BotCommand(command="language", description=t(lang, "cmd_language")),
++            BotCommand(command="settings", description=t(lang, "cmd_settings")),
++            BotCommand(command="mygroups", description=t(lang, "cmd_mygroups")),
+             BotCommand(command="cancel", description=t(lang, "cmd_cancel")),
+         ]
+ 
+@@ -121,14 +123,18 @@ async def main():
+     dp.include_routers(
+         stars.router,   # Stars payment handlers first
+         start.router,
++        settings.router,
++        groups.router,
+         download.router,
+         admin.router,
+     )
+ 
++    groups.register_group_middleware(dp)
++
+     dp.startup.register(on_startup)
+ 
+     logger.info("Starting polling...")
+-    await dp.start_polling(bot, allowed_updates=["message", "callback_query", "inline_query", "pre_checkout_query"])
++    await dp.start_polling(bot, allowed_updates=["message", "channel_post", "edited_message", "callback_query", "inline_query", "pre_checkout_query", "my_chat_member"])
+ 
+ if __name__ == "__main__":
+     asyncio.run(main())
+diff --git a/database/db.py b/database/db.py
+index 5a91645..2fc8f69 100644
+--- a/database/db.py
++++ b/database/db.py
+@@ -48,13 +48,13 @@ async def can_download(user_id: int) -> tuple[bool, str]:
+         return False, f"📭 Daily limit reached ({limit}/day).\n\n⭐ Buy {config.STARS_EXTRA_DOWNLOADS} extra downloads for {config.STARS_PRICE} Stars — /buy"
+     return True, ""
+ 
+-async def record_download(user_id: int, url: str, platform: str, title: str = None, file_size: int = 0):
++async def record_download(user_id: int, url: str, platform: str, title: str = None, file_size: int = 0, chat_id: int = None):
+     db = await get_db()
+     try:
+         today = date.today().isoformat()
+         await db.execute(
+-            "INSERT INTO downloads (user_id, url, platform, title, file_size) VALUES (?, ?, ?, ?, ?)",
+-            (user_id, url, platform, title, file_size)
++            "INSERT INTO downloads (user_id, url, platform, title, file_size, chat_id) VALUES (?, ?, ?, ?, ?, ?)",
++            (user_id, url, platform, title, file_size, chat_id)
+         )
+ 
+         # Check if user is over daily limit — use extra download instead
+@@ -110,6 +110,43 @@ async def use_extra_download(user_id: int):
+     finally:
+         await db.close()
+ 
++async def get_chat_download_stats(chat_id: int) -> dict:
++    """Per-chat download counts grouped by platform.
++
++    Returns:
++        {
++          "today":       {platform: count, ...},
++          "today_total": int,
++          "total":       {platform: count, ...},
++          "all_total":   int,
++        }
++    Counts only successfully recorded downloads (rows in `downloads`).
++    """
++    db = await get_db()
++    try:
++        today = date.today().isoformat()
++        today_rows = await db.execute_fetchall(
++            "SELECT platform, COUNT(*) FROM downloads "
++            "WHERE chat_id = ? AND date(created_at) = ? GROUP BY platform",
++            (chat_id, today),
++        )
++        total_rows = await db.execute_fetchall(
++            "SELECT platform, COUNT(*) FROM downloads "
++            "WHERE chat_id = ? GROUP BY platform",
++            (chat_id,),
++        )
++        today = {(r[0] or "unknown"): r[1] for r in today_rows}
++        total = {(r[0] or "unknown"): r[1] for r in total_rows}
++        return {
++            "today": today,
++            "today_total": sum(today.values()),
++            "total": total,
++            "all_total": sum(total.values()),
++        }
++    finally:
++        await db.close()
++
++
+ async def get_stats():
+     db = await get_db()
+     try:
+@@ -232,3 +269,254 @@ async def set_user_language(user_id: int, lang: str):
+         await db.commit()
+     finally:
+         await db.close()
++
++# ─── Per-user settings (language / tags / source channel / mode) ────
++# Columns that the user can toggle from their personal ⚙️ Settings menu.
++USER_FLAG_COLUMNS = {"show_tags", "show_source_channel"}
++VALID_DOWNLOAD_MODES = ("ask", "video", "audio")
++
++
++async def get_user_settings(user_id: int) -> dict:
++    """Return this user's personal preferences with safe defaults."""
++    db = await get_db()
++    try:
++        rows = await db.execute_fetchall(
++            "SELECT language, show_tags, show_source_channel, download_mode "
++            "FROM users WHERE user_id = ?",
++            (user_id,),
++        )
++        if not rows:
++            return {
++                "language": "en",
++                "show_tags": False,
++                "show_source_channel": False,
++                "download_mode": "ask",
++            }
++        r = dict(rows[0])
++        mode = r.get("download_mode") or "ask"
++        if mode not in VALID_DOWNLOAD_MODES:
++            mode = "ask"
++        return {
++            "language": r.get("language") or "en",
++            "show_tags": bool(r.get("show_tags")),
++            "show_source_channel": bool(r.get("show_source_channel")),
++            "download_mode": mode,
++        }
++    finally:
++        await db.close()
++
++
++async def toggle_user_flag(user_id: int, field: str) -> bool:
++    """Flip a boolean per-user preference column. Returns the new value."""
++    if field not in USER_FLAG_COLUMNS:
++        raise ValueError(f"Unknown user flag: {field}")
++    db = await get_db()
++    try:
++        rows = await db.execute_fetchall(
++            f"SELECT {field} FROM users WHERE user_id = ?", (user_id,)
++        )
++        current = bool(rows[0][0]) if rows else False
++        new = 0 if current else 1
++        await db.execute(
++            f"UPDATE users SET {field} = ? WHERE user_id = ?", (new, user_id)
++        )
++        await db.commit()
++        return bool(new)
++    finally:
++        await db.close()
++
++
++async def get_user_download_mode(user_id: int) -> str:
++    db = await get_db()
++    try:
++        rows = await db.execute_fetchall(
++            "SELECT download_mode FROM users WHERE user_id = ?", (user_id,)
++        )
++        mode = rows[0][0] if rows and rows[0][0] else "ask"
++        return mode if mode in VALID_DOWNLOAD_MODES else "ask"
++    finally:
++        await db.close()
++
++
++async def set_user_download_mode(user_id: int, mode: str):
++    if mode not in VALID_DOWNLOAD_MODES:
++        mode = "ask"
++    db = await get_db()
++    try:
++        await db.execute(
++            "UPDATE users SET download_mode = ? WHERE user_id = ?", (mode, user_id)
++        )
++        await db.commit()
++    finally:
++        await db.close()
++
++
++# ─── Per-group / per-chat settings ──────────────────────────
++# Boolean columns an admin can toggle from the per-group settings panel.
++GROUP_FLAG_COLUMNS = {"show_tags", "show_source_channel", "delete_user_url"}
++
++
++async def ensure_group_chat(chat_id: int, title: str = None, chat_type: str = None,
++                            added_by: int = None) -> None:
++    """Register (or refresh) a group/channel the bot lives in.
++
++    New rows inherit the current global `group_download_mode` so behaviour is
++    preserved for chats created before this feature. Existing rows only get
++    their title / type / added_by / is_active refreshed (settings untouched).
++    """
++    db = await get_db()
++    try:
++        rows = await db.execute_fetchall(
++            "SELECT chat_id FROM group_chats WHERE chat_id = ?", (chat_id,)
++        )
++        if rows:
++            # Refresh metadata, mark active again. Keep added_by if we already
++            # have one (don't overwrite the original adder with NULL).
++            if added_by is not None:
++                await db.execute(
++                    "UPDATE group_chats SET title = COALESCE(?, title), "
++                    "chat_type = COALESCE(?, chat_type), added_by = ?, is_active = 1 "
++                    "WHERE chat_id = ?",
++                    (title, chat_type, added_by, chat_id),
++                )
++            else:
++                await db.execute(
++                    "UPDATE group_chats SET title = COALESCE(?, title), "
++                    "chat_type = COALESCE(?, chat_type), is_active = 1 "
++                    "WHERE chat_id = ?",
++                    (title, chat_type, chat_id),
++                )
++        else:
++            default_mode = "ask"
++            srow = await db.execute_fetchall(
++                "SELECT value FROM bot_settings WHERE key = 'group_download_mode'"
++            )
++            if srow and srow[0][0] in VALID_DOWNLOAD_MODES:
++                default_mode = srow[0][0]
++            await db.execute(
++                "INSERT INTO group_chats (chat_id, title, chat_type, added_by, "
++                "download_mode, is_active) VALUES (?, ?, ?, ?, ?, 1)",
++                (chat_id, title, chat_type, added_by, default_mode),
++            )
++        await db.commit()
++    finally:
++        await db.close()
++
++
++async def set_group_inactive(chat_id: int) -> None:
++    """Mark a group inactive (bot was removed / kicked). Settings are kept."""
++    db = await get_db()
++    try:
++        await db.execute(
++            "UPDATE group_chats SET is_active = 0 WHERE chat_id = ?", (chat_id,)
++        )
++        await db.commit()
++    finally:
++        await db.close()
++
++
++def _group_row_to_settings(r: dict) -> dict:
++    mode = r.get("download_mode") or "ask"
++    if mode not in VALID_DOWNLOAD_MODES:
++        mode = "ask"
++    return {
++        "chat_id": r["chat_id"],
++        "title": r.get("title") or str(r["chat_id"]),
++        "chat_type": r.get("chat_type"),
++        "added_by": r.get("added_by"),
++        "show_tags": bool(r.get("show_tags")),
++        "show_source_channel": bool(r.get("show_source_channel")),
++        "download_mode": mode,
++        "delete_user_url": bool(r.get("delete_user_url")),
++        "is_active": bool(r.get("is_active")),
++    }
++
++
++async def get_group_settings(chat_id: int) -> dict | None:
++    """Return a group's settings dict, or None if the chat is unknown."""
++    db = await get_db()
++    try:
++        rows = await db.execute_fetchall(
++            "SELECT * FROM group_chats WHERE chat_id = ?", (chat_id,)
++        )
++        if not rows:
++            return None
++        return _group_row_to_settings(dict(rows[0]))
++    finally:
++        await db.close()
++
++
++async def list_user_groups(user_id: int) -> list[dict]:
++    """Active groups/chats this user added the bot to."""
++    db = await get_db()
++    try:
++        rows = await db.execute_fetchall(
++            "SELECT * FROM group_chats WHERE added_by = ? AND is_active = 1 "
++            "ORDER BY created_at DESC",
++            (user_id,),
++        )
++        return [_group_row_to_settings(dict(r)) for r in rows]
++    finally:
++        await db.close()
++
++
++async def list_active_groups(limit: int = 200) -> list[dict]:
++    """All active groups/chats the bot currently knows about (most recent first)."""
++    db = await get_db()
++    try:
++        rows = await db.execute_fetchall(
++            "SELECT * FROM group_chats WHERE is_active = 1 "
++            "ORDER BY created_at DESC LIMIT ?",
++            (limit,),
++        )
++        return [_group_row_to_settings(dict(r)) for r in rows]
++    finally:
++        await db.close()
++
++
++async def claim_group(chat_id: int, user_id: int) -> None:
++    """Attribute a group with unknown adder to a confirmed admin, so it lists
++    instantly next time. Only fills added_by when it is currently NULL."""
++    db = await get_db()
++    try:
++        await db.execute(
++            "UPDATE group_chats SET added_by = ? WHERE chat_id = ? AND added_by IS NULL",
++            (user_id, chat_id),
++        )
++        await db.commit()
++    finally:
++        await db.close()
++
++
++async def toggle_group_flag(chat_id: int, field: str) -> bool:
++    """Flip a boolean per-group setting. Returns the new value."""
++    if field not in GROUP_FLAG_COLUMNS:
++        raise ValueError(f"Unknown group flag: {field}")
++    db = await get_db()
++    try:
++        rows = await db.execute_fetchall(
++            f"SELECT {field} FROM group_chats WHERE chat_id = ?", (chat_id,)
++        )
++        if not rows:
++            raise ValueError("Unknown group")
++        new = 0 if bool(rows[0][0]) else 1
++        await db.execute(
++            f"UPDATE group_chats SET {field} = ? WHERE chat_id = ?", (new, chat_id)
++        )
++        await db.commit()
++        return bool(new)
++    finally:
++        await db.close()
++
++
++async def set_group_download_mode(chat_id: int, mode: str) -> None:
++    if mode not in VALID_DOWNLOAD_MODES:
++        mode = "ask"
++    db = await get_db()
++    try:
++        await db.execute(
++            "UPDATE group_chats SET download_mode = ? WHERE chat_id = ?", (mode, chat_id)
++        )
++        await db.commit()
++    finally:
++        await db.close()
+diff --git a/database/models.py b/database/models.py
+index a636f24..e005140 100644
+--- a/database/models.py
++++ b/database/models.py
+@@ -37,6 +37,19 @@ CREATE TABLE IF NOT EXISTS bot_settings (
+     key TEXT PRIMARY KEY,
+     value TEXT
+ );
++
++CREATE TABLE IF NOT EXISTS group_chats (
++    chat_id INTEGER PRIMARY KEY,
++    title TEXT,
++    chat_type TEXT,
++    added_by INTEGER,
++    show_tags INTEGER DEFAULT 0,
++    show_source_channel INTEGER DEFAULT 0,
++    download_mode TEXT DEFAULT 'ask',
++    delete_user_url INTEGER DEFAULT 0,
++    is_active INTEGER DEFAULT 1,
++    created_at TEXT DEFAULT CURRENT_TIMESTAMP
++);
+ """
+ 
+ # Settings that can be toggled from the admin panel. Default: all enabled ("1").
+@@ -47,11 +60,16 @@ DEFAULT_SETTINGS = {
+     "feature_stars": "1",
+     "feature_bulk_stories": "1",
+     "feature_language_select": "1",
++    # Per-user Settings menu (⚙️) — ON by default
++    "feature_user_settings": "1",
+     # Reply-keyboard buttons inside groups/channels — OFF by default
+     "feature_group_buttons": "0",
+-    # Show source hashtags in the video caption — OFF by default
++    # Show source hashtags in the video caption — OFF by default.
++    # NOTE: this is now a GLOBAL master "force-on for everyone" switch.
++    # When OFF (default) each user decides via their personal Settings menu.
+     "feature_show_tags": "0",
+-    # Show source channel/author login in the caption — OFF by default
++    # Show source channel/author login in the caption — OFF by default.
++    # Same semantics as feature_show_tags (global force-on for everyone).
+     "feature_show_source_channel": "0",
+     # In groups/channels: what to do with a link.
+     #   "ask"   — show the quality/format buttons (default)
+@@ -64,11 +82,32 @@ DEFAULT_SETTINGS = {
+ async def init_db(db_path: str):
+     async with aiosqlite.connect(db_path) as db:
+         await db.executescript(DB_SCHEMA)
+-        # Migration: add language column to users if missing
++        # Migration: add per-user columns to `users` if missing.
+         cur = await db.execute("PRAGMA table_info(users)")
+         cols = [r[1] for r in await cur.fetchall()]
+         if "language" not in cols:
+             await db.execute("ALTER TABLE users ADD COLUMN language TEXT DEFAULT 'en'")
++        # Per-user preference: show source hashtags in the caption (0/1)
++        if "show_tags" not in cols:
++            await db.execute("ALTER TABLE users ADD COLUMN show_tags INTEGER DEFAULT 0")
++        # Per-user preference: show source channel/@login in the caption (0/1)
++        if "show_source_channel" not in cols:
++            await db.execute("ALTER TABLE users ADD COLUMN show_source_channel INTEGER DEFAULT 0")
++        # Per-user default download mode in private chats:
++        #   "ask"   — show quality/format buttons (default)
++        #   "video" — auto-download video, no buttons
++        #   "audio" — auto-download audio, no buttons
++        if "download_mode" not in cols:
++            await db.execute("ALTER TABLE users ADD COLUMN download_mode TEXT DEFAULT 'ask'")
++        # Migration: add chat_id to `downloads` so we can show per-chat/per-group
++        # download statistics (grouped by platform). NULL for old rows.
++        cur = await db.execute("PRAGMA table_info(downloads)")
++        dl_cols = [r[1] for r in await cur.fetchall()]
++        if "chat_id" not in dl_cols:
++            await db.execute("ALTER TABLE downloads ADD COLUMN chat_id INTEGER")
++        await db.execute(
++            "CREATE INDEX IF NOT EXISTS idx_downloads_chat ON downloads(chat_id, created_at)"
++        )
+         # Seed default settings
+         for k, v in DEFAULT_SETTINGS.items():
+             await db.execute(
+diff --git a/handlers/admin.py b/handlers/admin.py
+index 352b5fb..2248fa8 100644
+--- a/handlers/admin.py
++++ b/handlers/admin.py
+@@ -256,6 +256,7 @@ SETTING_KEYS = {
+     "feature_stars": "set_stars",
+     "feature_bulk_stories": "set_bulk",
+     "feature_language_select": "set_lang",
++    "feature_user_settings": "set_user_settings",
+     "feature_group_buttons": "set_group_buttons",
+     "feature_show_tags": "set_show_tags",
+     "feature_show_source_channel": "set_show_source_channel",
+diff --git a/handlers/download.py b/handlers/download.py
+index c7c4c23..4d2b9bb 100644
+--- a/handlers/download.py
++++ b/handlers/download.py
+@@ -6,7 +6,8 @@ from aiogram.types import Message, CallbackQuery, FSInputFile
+ from aiogram.filters import Command
+ from database.db import (
+     can_download, record_download, use_extra_download,
+-    get_setting, get_user_language,
++    get_setting, get_user_language, get_user_download_mode, get_user_settings,
++    get_group_settings, ensure_group_chat,
+ )
+ from services.platform import detect_platform, get_platform_info
+ from services.downloader import download, get_info, cleanup_file, DownloadResult
+@@ -185,7 +186,7 @@ async def handle_bulk_stories(message: Message, bot: Bot, url: str, user_id: int
+                 parse_mode="HTML", supports_streaming=True,
+             )
+             downloaded += 1
+-            await record_download(user_id, url, "instagram", result["title"], file_size)
++            await record_download(user_id, url, "instagram", result["title"], file_size, chat_id=message.chat.id)
+             await progress_msg.delete()
+         except Exception as e:
+             failed += 1
+@@ -227,13 +228,25 @@ async def handle_link(message: Message, bot: Bot):
+         await handle_bulk_stories(message, bot, url, user_id)
+         return
+ 
+-    # In groups/channels the admin can choose to auto-download instead of
+-    # showing the inline buttons. In private chats we always show buttons.
++    # Decide whether to auto-download or show the quality/format buttons.
++    #   • In groups/channels: the admin's group_download_mode applies.
++    #   • In private chats: the user's personal download_mode applies
++    #     (set in their ⚙️ Settings menu). Default "ask" shows buttons.
+     is_group = message.chat.type in ("group", "supergroup", "channel")
+-    group_mode = await get_setting("group_download_mode", "ask") if is_group else "ask"
++    if is_group:
++        # Per-group download mode (set by the group's admin in "My groups").
++        g = await get_group_settings(message.chat.id)
++        if g is None:
++            # Chat existed before this feature — register it now so it shows up
++            # for whoever opens the group list later. added_by stays unknown.
++            await ensure_group_chat(message.chat.id, message.chat.title, message.chat.type)
++            g = await get_group_settings(message.chat.id)
++        auto_mode = g["download_mode"] if g else await get_setting("group_download_mode", "ask")
++    else:
++        auto_mode = await get_user_download_mode(user_id)
+ 
+-    if is_group and group_mode in ("video", "audio"):
+-        quality = "audio" if group_mode == "audio" else "best"
++    if auto_mode in ("video", "audio"):
++        quality = "audio" if auto_mode == "audio" else "best"
+         loading = await message.reply(t(lang, "analyzing"))
+         short_id = store_url(url, platform)
+         await process_quality_download(
+@@ -350,6 +363,34 @@ async def process_quality_download(bot: Bot, user_id: int, quality: str, short_i
+         await status_msg.edit_text(t(lang, "dl_failed", error=error_text), parse_mode="HTML")
+         return
+ 
++    # Effective caption flags + per-group "delete user's link" behaviour.
++    #   • Groups/channels (chat_id < 0): use the per-group settings configured
++    #     in "My groups". Admin global flags act as a force-on-for-everyone OR.
++    #   • Private chats: use the user's personal ⚙️ Settings.
++    admin_tags = await get_setting("feature_show_tags", "0") == "1"
++    admin_channel = await get_setting("feature_show_source_channel", "0") == "1"
++    delete_user_url = False
++    if chat_id < 0:
++        g = await get_group_settings(chat_id)
++        if g:
++            show_tags = admin_tags or g["show_tags"]
++            show_source_channel = admin_channel or g["show_source_channel"]
++            delete_user_url = g["delete_user_url"]
++        else:
++            show_tags = admin_tags
++            show_source_channel = admin_channel
++    else:
++        user_prefs = await get_user_settings(user_id)
++        show_tags = admin_tags or user_prefs["show_tags"]
++        show_source_channel = admin_channel or user_prefs["show_source_channel"]
++
++    async def _maybe_delete_user_link():
++        if delete_user_url and reply_to_message_id:
++            try:
++                await bot.delete_message(chat_id, reply_to_message_id)
++            except Exception:
++                pass  # bot may lack delete rights, or message already gone
++
+     if result.file_size > config.MAX_FILE_SIZE:
+         await status_msg.edit_text(t(lang, "too_large_split", size=format_size(result.file_size)), parse_mode="HTML")
+         from services.downloader import split_video
+@@ -381,16 +422,14 @@ async def process_quality_download(bot: Bot, user_id: int, quality: str, short_i
+                 await bot.send_message(chat_id, t(lang, "part_failed", i=i, error=str(e)[:50]))
+                 cleanup_file(part_path)
+ 
+-        await record_download(user_id, url, platform, result.title, result.file_size)
++        await record_download(user_id, url, platform, result.title, result.file_size, chat_id=chat_id)
++        await _maybe_delete_user_link()
+         await status_msg.delete()
+         cleanup_file(result.file_path)
+         return
+ 
+     await status_msg.edit_text(t(lang, "uploading"), parse_mode="HTML")
+ 
+-    show_tags = await get_setting("feature_show_tags", "0") == "1"
+-    show_source_channel = await get_setting("feature_show_source_channel", "0") == "1"
+-
+     try:
+         caption = build_caption(
+             result, via_user=via_user,
+@@ -410,7 +449,8 @@ async def process_quality_download(bot: Bot, user_id: int, quality: str, short_i
+                 reply_to_message_id=reply_to_message_id,
+             )
+ 
+-        await record_download(user_id, url, platform, result.title, result.file_size)
++        await record_download(user_id, url, platform, result.title, result.file_size, chat_id=chat_id)
++        await _maybe_delete_user_link()
+         await status_msg.delete()
+     except Exception as e:
+         await status_msg.edit_text(t(lang, "upload_failed", error=str(e)[:100]))
+diff --git a/handlers/start.py b/handlers/start.py
+index ad5d07c..9bdaed1 100644
+--- a/handlers/start.py
++++ b/handlers/start.py
+@@ -3,8 +3,10 @@ from aiogram.types import Message, CallbackQuery
+ from aiogram.filters import CommandStart, Command
+ from database.db import (
+     get_or_create_user, get_user_language, set_user_language, get_setting,
++    get_chat_download_stats,
+ )
+ from services.i18n import t, LANGUAGES
++from services.platform import get_platform_info
+ from keyboards.inline import main_menu_keyboard, language_keyboard
+ from config import config
+ 
+@@ -15,7 +17,8 @@ async def _menu_flags():
+     """Read admin toggles that affect the user menu."""
+     show_buy = await get_setting("feature_stars", "1") == "1"
+     show_lang = await get_setting("feature_language_select", "1") == "1"
+-    return show_buy, show_lang
++    show_settings = await get_setting("feature_user_settings", "1") == "1"
++    return show_buy, show_lang, show_settings
+ 
+ 
+ async def send_main_menu(message: Message, lang: str):
+@@ -29,13 +32,14 @@ async def send_main_menu(message: Message, lang: str):
+             await message.answer(t(lang, "group_intro"), parse_mode="HTML")
+             return
+ 
+-    show_buy, show_lang = await _menu_flags()
++    show_buy, show_lang, show_settings = await _menu_flags()
+     is_admin = is_private and message.chat.id == config.ADMIN_ID
+     await message.answer(
+         t(lang, "welcome"),
+         parse_mode="HTML",
+         reply_markup=main_menu_keyboard(
+-            lang, show_buy=show_buy, show_language=show_lang, is_admin=is_admin
++            lang, show_buy=show_buy, show_language=show_lang,
++            is_admin=is_admin, show_settings=show_settings,
+         ),
+     )
+ 
+@@ -69,15 +73,57 @@ async def btn_help(message: Message):
+     await message.answer(t(lang, "help"), parse_mode="HTML")
+ 
+ 
+-# ─── Button: My stats ───────────────────────────────────────
+-@router.message(F.text.func(lambda txt: txt and any(
+-    txt == t(code, "btn_stats") for code in LANGUAGES
+-)))
+-async def btn_stats(message: Message):
+-    if not await _buttons_allowed(message):
++# Order platforms are listed in the chat-stats message.
++_PLATFORM_ORDER = ["youtube", "instagram", "tiktok"]
++
++
++def _platform_lines(counts: dict) -> str:
++    """Render '🔴 YouTube — 12' lines for a {platform: count} dict."""
++    keys = [p for p in _PLATFORM_ORDER if p in counts]
++    keys += [p for p in counts if p not in _PLATFORM_ORDER]  # any extras (e.g. unknown)
++    lines = []
++    for p in keys:
++        info = get_platform_info(p)
++        lines.append(f"{info.icon} {info.name} \u2014 {counts[p]}")
++    return "\n".join(lines)
++
++
++async def _render_chat_stats(message: Message, lang: str):
++    """Per-chat download stats grouped by platform (used in groups/channels)."""
++    s = await get_chat_download_stats(message.chat.id)
++    if s["all_total"] == 0:
++        await message.answer(t(lang, "chat_stats_none"), parse_mode="HTML")
+         return
++    parts = [t(lang, "chat_stats_title")]
++    # Today
++    parts.append("")
++    parts.append(t(lang, "chat_stats_today"))
++    if s["today_total"] == 0:
++        parts.append(t(lang, "chat_stats_zero"))
++    else:
++        parts.append(_platform_lines(s["today"]))
++        parts.append(t(lang, "chat_stats_total_line", n=s["today_total"]))
++    # All-time
++    parts.append("")
++    parts.append(t(lang, "chat_stats_alltime"))
++    parts.append(_platform_lines(s["total"]))
++    parts.append(t(lang, "chat_stats_total_line", n=s["all_total"]))
++    await message.answer("\n".join(parts), parse_mode="HTML")
++
++
++# ─── My stats (button + /stats command) ─────────────────────
++async def _render_stats(message: Message):
+     lang = await get_user_language(message.from_user.id)
+-    user = await get_or_create_user(message.from_user.id)
++    # In groups/channels /stats shows this chat's download counts by platform.
++    if message.chat.type != "private":
++        await _render_chat_stats(message, lang)
++        return
++    # Private chat: personal usage/limits (unchanged).
++    user = await get_or_create_user(
++        message.from_user.id,
++        message.from_user.username,
++        message.from_user.first_name,
++    )
+     limit = user["daily_limit"] if user["daily_limit"] is not None else config.DAILY_LIMIT
+     used = user["downloads_today"]
+     extra = user["extra_downloads"]
+@@ -89,27 +135,63 @@ async def btn_stats(message: Message):
+     )
+ 
+ 
+-# ─── Button: Language ───────────────────────────────────────
+ @router.message(F.text.func(lambda txt: txt and any(
+-    txt == t(code, "btn_language") for code in LANGUAGES
++    txt == t(code, "btn_stats") for code in LANGUAGES
+ )))
+-async def btn_language(message: Message):
++async def btn_stats(message: Message):
+     if not await _buttons_allowed(message):
+         return
++    await _render_stats(message)
++
++
++# /stats works everywhere (private chats and groups, for any member)
++@router.message(Command("stats"))
++async def cmd_stats(message: Message):
++    await _render_stats(message)
++
++
++async def _is_group_admin(bot, chat_id: int, user_id: int) -> bool:
++    """True if user_id is an administrator or the creator of the group/chat."""
++    try:
++        member = await bot.get_chat_member(chat_id, user_id)
++        return member.status in ("administrator", "creator")
++    except Exception:
++        return False
++
++
++async def _open_language(message: Message):
++    """Show the language picker (after feature + permission checks)."""
++    lang = await get_user_language(message.from_user.id)
+     if await get_setting("feature_language_select", "1") != "1":
+-        lang = await get_user_language(message.from_user.id)
+         await message.answer(t(lang, "feature_disabled"))
+         return
+-    lang = await get_user_language(message.from_user.id)
+     await message.answer(t(lang, "choose_language"), reply_markup=language_keyboard())
+ 
+ 
++# ─── Button: Language ───────────────────────────────────────
++@router.message(F.text.func(lambda txt: txt and any(
++    txt == t(code, "btn_language") for code in LANGUAGES
++)))
++async def btn_language(message: Message):
++    if not await _buttons_allowed(message):
++        return
++    await _open_language(message)
++
++
+ @router.callback_query(F.data.startswith("lang:"))
+ async def set_language_cb(callback: CallbackQuery):
+     code = callback.data.split(":", 1)[1]
+     if code not in LANGUAGES:
+         await callback.answer()
+         return
++    # In groups only admins may change the language (matches /language gating).
++    chat = callback.message.chat
++    if chat.type != "private" and not await _is_group_admin(
++        callback.bot, chat.id, callback.from_user.id
++    ):
++        cur = await get_user_language(callback.from_user.id)
++        await callback.answer(t(cur, "lang_admins_only"), show_alert=True)
++        return
+     await set_user_language(callback.from_user.id, code)
+     await callback.answer(t(code, "language_set"))
+     try:
+@@ -163,4 +245,16 @@ async def cmd_help(message: Message):
+ 
+ @router.message(Command("language"))
+ async def cmd_language(message: Message):
+-    await btn_language(message)
++    # Private chats: anyone may change their own language.
++    # Groups/channels: only chat admins may change it.
++    await get_or_create_user(
++        message.from_user.id,
++        message.from_user.username,
++        message.from_user.first_name,
++    )
++    if message.chat.type != "private":
++        if not await _is_group_admin(message.bot, message.chat.id, message.from_user.id):
++            lang = await get_user_language(message.from_user.id)
++            await message.reply(t(lang, "lang_admins_only"))
++            return
++    await _open_language(message)
+diff --git a/keyboards/inline.py b/keyboards/inline.py
+index bb0d71e..806ce1d 100644
+--- a/keyboards/inline.py
++++ b/keyboards/inline.py
+@@ -6,7 +6,7 @@ from config import config
+ from services.i18n import t, LANGUAGES
+ 
+ 
+-def main_menu_keyboard(lang: str = "en", show_buy: bool = True, show_language: bool = True, is_admin: bool = False) -> ReplyKeyboardMarkup:
++def main_menu_keyboard(lang: str = "en", show_buy: bool = True, show_language: bool = True, is_admin: bool = False, show_settings: bool = True) -> ReplyKeyboardMarkup:
+     """Persistent reply-keyboard menu shown to users (buttons instead of commands)."""
+     rows = [[KeyboardButton(text=t(lang, "btn_help")), KeyboardButton(text=t(lang, "btn_stats"))]]
+     last = []
+@@ -16,6 +16,8 @@ def main_menu_keyboard(lang: str = "en", show_buy: bool = True, show_language: b
+         last.append(KeyboardButton(text=t(lang, "btn_language")))
+     if last:
+         rows.append(last)
++    if show_settings:
++        rows.append([KeyboardButton(text=t(lang, "btn_settings"))])
+     # Add bot to group/channel (single button -> inline group/channel choice)
+     rows.append([KeyboardButton(text=t(lang, "btn_add_bot"))])
+     if is_admin:
+@@ -29,6 +31,131 @@ def language_keyboard() -> InlineKeyboardMarkup:
+     return InlineKeyboardMarkup(inline_keyboard=rows)
+ 
+ 
++# ─── Per-user settings menu ─────────────────────────────────
++def settings_keyboard(lang: str, settings: dict) -> InlineKeyboardMarkup:
++    """Build the personal ⚙️ settings panel.
++
++    `settings` is the dict returned by db.get_user_settings():
++      {language, show_tags(bool), show_source_channel(bool), download_mode}
++    """
++    on = t(lang, "opt_on")
++    off = t(lang, "opt_off")
++    cur_lang = LANGUAGES.get(settings.get("language", "en"), settings.get("language", "en"))
++    mode_label = t(lang, {
++        "ask": "mode_ask",
++        "video": "mode_video",
++        "audio": "mode_audio",
++    }.get(settings.get("download_mode", "ask"), "mode_ask"))
++
++    rows = [
++        [InlineKeyboardButton(
++            text=f"{t(lang, 'set_opt_language')}: {cur_lang}",
++            callback_data="uset:lang",
++        )],
++        [InlineKeyboardButton(
++            text=f"{t(lang, 'set_opt_tags')}: {on if settings.get('show_tags') else off}",
++            callback_data="uset:toggle:show_tags",
++        )],
++        [InlineKeyboardButton(
++            text=f"{t(lang, 'set_opt_channel')}: {on if settings.get('show_source_channel') else off}",
++            callback_data="uset:toggle:show_source_channel",
++        )],
++        [InlineKeyboardButton(
++            text=f"{t(lang, 'set_opt_mode')}: {mode_label}",
++            callback_data="uset:mode",
++        )],
++        [InlineKeyboardButton(
++            text=t(lang, "btn_my_groups"),
++            callback_data="gset:list",
++        )],
++        [InlineKeyboardButton(text=t(lang, "btn_close"), callback_data="uset:close")],
++    ]
++    return InlineKeyboardMarkup(inline_keyboard=rows)
++
++
++def settings_language_keyboard(lang: str) -> InlineKeyboardMarkup:
++    """Language picker shown from inside the settings panel (returns to it)."""
++    rows = [[InlineKeyboardButton(text=name, callback_data=f"uset:setlang:{code}")]
++            for code, name in LANGUAGES.items()]
++    rows.append([InlineKeyboardButton(text=t(lang, "btn_back"), callback_data="uset:back")])
++    return InlineKeyboardMarkup(inline_keyboard=rows)
++
++
++def settings_mode_keyboard(lang: str, current: str) -> InlineKeyboardMarkup:
++    """Download-mode picker (ask / video / audio), returns to settings panel."""
++    mark = "\u2713 "
++    rows = []
++    for mode, key in (("ask", "mode_ask"), ("video", "mode_video"), ("audio", "mode_audio")):
++        prefix = mark if current == mode else ""
++        rows.append([InlineKeyboardButton(
++            text=f"{prefix}{t(lang, key)}",
++            callback_data=f"uset:setmode:{mode}",
++        )])
++    rows.append([InlineKeyboardButton(text=t(lang, "btn_back"), callback_data="uset:back")])
++    return InlineKeyboardMarkup(inline_keyboard=rows)
++
++
++# ─── Per-group settings ─────────────────────────────────────
++def groups_list_keyboard(lang: str, groups: list) -> InlineKeyboardMarkup:
++    """List of groups/chats the user added the bot to."""
++    rows = []
++    for g in groups:
++        rows.append([InlineKeyboardButton(
++            text=f"\U0001F465 {g['title']}",
++            callback_data=f"gset:open:{g['chat_id']}",
++        )])
++    rows.append([InlineKeyboardButton(text=t(lang, "btn_close"), callback_data="gset:close")])
++    return InlineKeyboardMarkup(inline_keyboard=rows)
++
++
++def group_settings_keyboard(lang: str, settings: dict) -> InlineKeyboardMarkup:
++    """Per-group settings panel: hashtags / source channel / mode / delete-url."""
++    on = t(lang, "opt_on")
++    off = t(lang, "opt_off")
++    cid = settings["chat_id"]
++    mode_label = t(lang, {
++        "ask": "mode_ask", "video": "mode_video", "audio": "mode_audio",
++    }.get(settings.get("download_mode", "ask"), "mode_ask"))
++
++    rows = [
++        [InlineKeyboardButton(
++            text=f"{t(lang, 'set_opt_tags')}: {on if settings.get('show_tags') else off}",
++            callback_data=f"gset:toggle:{cid}:show_tags",
++        )],
++        [InlineKeyboardButton(
++            text=f"{t(lang, 'set_opt_channel')}: {on if settings.get('show_source_channel') else off}",
++            callback_data=f"gset:toggle:{cid}:show_source_channel",
++        )],
++        [InlineKeyboardButton(
++            text=f"{t(lang, 'set_opt_mode')}: {mode_label}",
++            callback_data=f"gset:mode:{cid}",
++        )],
++        [InlineKeyboardButton(
++            text=f"{t(lang, 'set_opt_delete_url')}: {on if settings.get('delete_user_url') else off}",
++            callback_data=f"gset:toggle:{cid}:delete_user_url",
++        )],
++        [
++            InlineKeyboardButton(text=t(lang, "btn_back"), callback_data="gset:list"),
++            InlineKeyboardButton(text=t(lang, "btn_close"), callback_data="gset:close"),
++        ],
++    ]
++    return InlineKeyboardMarkup(inline_keyboard=rows)
++
++
++def group_mode_keyboard(lang: str, current: str, chat_id: int) -> InlineKeyboardMarkup:
++    """Download-mode picker for a specific group, returns to its panel."""
++    mark = "\u2713 "
++    rows = []
++    for mode, key in (("ask", "mode_ask"), ("video", "mode_video"), ("audio", "mode_audio")):
++        prefix = mark if current == mode else ""
++        rows.append([InlineKeyboardButton(
++            text=f"{prefix}{t(lang, key)}",
++            callback_data=f"gset:setmode:{chat_id}:{mode}",
++        )])
++    rows.append([InlineKeyboardButton(text=t(lang, "btn_back"), callback_data=f"gset:open:{chat_id}")])
++    return InlineKeyboardMarkup(inline_keyboard=rows)
++
++
+ def quality_keyboard(short_id: str, platform: str) -> InlineKeyboardMarkup:
+     buttons = []
+     if platform in ("youtube", "unknown"):
+diff --git a/services/i18n.py b/services/i18n.py
+index 7c792b1..726c6b6 100644
+--- a/services/i18n.py
++++ b/services/i18n.py
+@@ -18,6 +18,20 @@ TRANSLATIONS = {
+         "choose_language": "\U0001F310 Choose your language:",
+         "language_set": "\u2705 Language set to English.",
+         "feature_disabled": "\u26A0\uFE0F This feature is currently disabled by the admin.",
++        "lang_admins_only": "\u26D4\uFE0F Only group admins can change the language here.",
++        "btn_my_groups": "\U0001F465 My groups",
++        "cmd_mygroups": "Configure your groups",
++        "my_groups_title": "\U0001F465 <b>Your groups & channels</b>\n\nThese are the chats you added me to. Tap one to configure it.",
++        "my_groups_empty": "\U0001F465 <b>Your groups & channels</b>\n\nYou haven\u2019t added me to any group or channel yet.\nAdd me to one, then come back here to configure it.",
++        "group_settings_title": "\u2699\uFE0F <b>{title}</b>\n\nConfigure how I behave in this chat. Tap an option to change it.",
++        "set_opt_delete_url": "\U0001F5D1 Delete user\u2019s link",
++        "group_no_access": "\u26D4\uFE0F You can only manage groups you added me to (or where you\u2019re an admin).",
++        "chat_stats_title": "\U0001F4CA <b>Downloads in this chat</b>",
++        "chat_stats_today": "\U0001F4C5 <b>Today</b>",
++        "chat_stats_alltime": "\U0001F5C2 <b>All time</b>",
++        "chat_stats_total_line": "\u2796 <b>Total: {n}</b>",
++        "chat_stats_zero": "\u2014 no downloads yet",
++        "chat_stats_none": "\U0001F4CA <b>Downloads in this chat</b>\n\nNo downloads yet. Send a link from YouTube, Instagram or TikTok!",
+         "analyzing": "\U0001F50D Analyzing link...",
+         "downloading": "\U0001F4E5 <b>Downloading...</b>\n\u23F3 This may take a moment",
+         "uploading": "\U0001F4E4 Uploading to Telegram...",
+@@ -59,6 +73,23 @@ TRANSLATIONS = {
+         "btn_add_channel": "\u2795 Add to Channel",
+         "add_group_help": "\U0001F465 <b>Add Bot to Group</b>\n\n1. Tap the button below\n2. Choose a group or channel\n3. Grant admin rights\n\n\u2705 The bot will automatically download videos from links.",
+         "group_intro": "\U0001F44B <b>Hi! I'm a media downloader bot.</b>\n\nI can download videos from \U0001F534 YouTube, \U0001F4F8 Instagram and \U0001F3B5 TikTok, plus Instagram stories by @username.\n\n\U0001F4AC <b>In groups</b> just send me a supported link and I'll handle it.\n\nCommands: /help /stats /buy /language\n\n\U0001F4E9 For full features and buttons, open me in a <b>private chat</b>.",
++        # ─── User settings menu ───
++        "btn_settings": "\u2699\uFE0F Settings",
++        "cmd_settings": "Your personal settings",
++        "settings_title": "\u2699\uFE0F <b>Your Settings</b>\n\nCustomize how the bot works for you. Tap an option to change it.",
++        "set_opt_language": "\U0001F310 Language",
++        "set_opt_tags": "#\uFE0F\u20E3 Source hashtags",
++        "set_opt_channel": "\U0001F4E3 Source channel",
++        "set_opt_mode": "\U0001F3AC Download mode",
++        "opt_on": "\u2705 On",
++        "opt_off": "\u274C Off",
++        "mode_ask": "\u2753 Ask each time",
++        "mode_video": "\U0001F3AC Video",
++        "mode_audio": "\U0001F3B5 Audio",
++        "choose_mode": "\U0001F3AC <b>Default download mode</b>\n\nChoose what happens when you send a link:\n\u2022 <b>Ask each time</b> — show quality/format buttons\n\u2022 <b>Video</b> — download video automatically\n\u2022 <b>Audio</b> — download audio automatically",
++        "btn_back": "\u2B05\uFE0F Back",
++        "btn_close": "\u2716\uFE0F Close",
++        "setting_saved": "\u2705 Saved",
+     },
+     "ru": {
+         "welcome": "\U0001F3AC <b>\u0421\u043A\u0430\u0447\u0438\u0432\u0430\u0442\u0435\u043B\u044C \u0432\u0438\u0434\u0435\u043E</b>\n\n\u041E\u0442\u043F\u0440\u0430\u0432\u044C \u0441\u0441\u044B\u043B\u043A\u0443 \u0441 YouTube, Instagram \u0438\u043B\u0438 TikTok, \u0438\u043B\u0438 \u0432\u0432\u0435\u0434\u0438 @username \u0434\u043B\u044F \u0441\u0442\u043E\u0440\u0438\u0441 Instagram.\n\n\u0418\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u0439 \u043A\u043D\u043E\u043F\u043A\u0438 \u043D\u0438\u0436\u0435.",
+@@ -71,6 +102,20 @@ TRANSLATIONS = {
+         "choose_language": "\U0001F310 \u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u044F\u0437\u044B\u043A:",
+         "language_set": "\u2705 \u042F\u0437\u044B\u043A: \u0420\u0443\u0441\u0441\u043A\u0438\u0439.",
+         "feature_disabled": "\u26A0\uFE0F \u042D\u0442\u0430 \u0444\u0443\u043D\u043A\u0446\u0438\u044F \u043E\u0442\u043A\u043B\u044E\u0447\u0435\u043D\u0430 \u0430\u0434\u043C\u0438\u043D\u043E\u043C.",
++        "lang_admins_only": "\u26D4\uFE0F \u041C\u0435\u043D\u044F\u0442\u044C \u044F\u0437\u044B\u043A \u0437\u0434\u0435\u0441\u044C \u043C\u043E\u0433\u0443\u0442 \u0442\u043E\u043B\u044C\u043A\u043E \u0430\u0434\u043C\u0438\u043D\u044B \u0433\u0440\u0443\u043F\u043F\u044B.",
++        "btn_my_groups": "\U0001F465 \u041C\u043E\u0438 \u0433\u0440\u0443\u043F\u043F\u044B",
++        "cmd_mygroups": "\u041D\u0430\u0441\u0442\u0440\u043E\u0438\u0442\u044C \u0432\u0430\u0448\u0438 \u0433\u0440\u0443\u043F\u043F\u044B",
++        "my_groups_title": "\U0001F465 <b>\u0412\u0430\u0448\u0438 \u0433\u0440\u0443\u043F\u043F\u044B \u0438 \u043A\u0430\u043D\u0430\u043B\u044B</b>\n\n\u042D\u0442\u043E \u0447\u0430\u0442\u044B, \u043A\u0443\u0434\u0430 \u0432\u044B \u043C\u0435\u043D\u044F \u0434\u043E\u0431\u0430\u0432\u0438\u043B\u0438. \u041D\u0430\u0436\u043C\u0438\u0442\u0435 \u043D\u0430 \u0447\u0430\u0442, \u0447\u0442\u043E\u0431\u044B \u043D\u0430\u0441\u0442\u0440\u043E\u0438\u0442\u044C \u0435\u0433\u043E.",
++        "my_groups_empty": "\U0001F465 <b>\u0412\u0430\u0448\u0438 \u0433\u0440\u0443\u043F\u043F\u044B \u0438 \u043A\u0430\u043D\u0430\u043B\u044B</b>\n\n\u0412\u044B \u0435\u0449\u0451 \u043D\u0435 \u0434\u043E\u0431\u0430\u0432\u0438\u043B\u0438 \u043C\u0435\u043D\u044F \u043D\u0438 \u0432 \u043E\u0434\u043D\u0443 \u0433\u0440\u0443\u043F\u043F\u0443 \u0438\u043B\u0438 \u043A\u0430\u043D\u0430\u043B.\n\u0414\u043E\u0431\u0430\u0432\u044C\u0442\u0435 \u043C\u0435\u043D\u044F \u0438 \u0432\u0435\u0440\u043D\u0438\u0442\u0435\u0441\u044C \u0441\u044E\u0434\u0430 \u0434\u043B\u044F \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0438.",
++        "group_settings_title": "\u2699\uFE0F <b>{title}</b>\n\n\u041D\u0430\u0441\u0442\u0440\u043E\u0439\u0442\u0435, \u043A\u0430\u043A \u044F \u0440\u0430\u0431\u043E\u0442\u0430\u044E \u0432 \u044D\u0442\u043E\u043C \u0447\u0430\u0442\u0435. \u041D\u0430\u0436\u043C\u0438\u0442\u0435 \u043D\u0430 \u043F\u0443\u043D\u043A\u0442, \u0447\u0442\u043E\u0431\u044B \u0438\u0437\u043C\u0435\u043D\u0438\u0442\u044C.",
++        "set_opt_delete_url": "\U0001F5D1 \u0423\u0434\u0430\u043B\u044F\u0442\u044C \u0441\u0441\u044B\u043B\u043A\u0443 \u044E\u0437\u0435\u0440\u0430",
++        "group_no_access": "\u26D4\uFE0F \u041D\u0430\u0441\u0442\u0440\u0430\u0438\u0432\u0430\u0442\u044C \u043C\u043E\u0436\u043D\u043E \u0442\u043E\u043B\u044C\u043A\u043E \u0433\u0440\u0443\u043F\u043F\u044B, \u043A\u0443\u0434\u0430 \u0432\u044B \u043C\u0435\u043D\u044F \u0434\u043E\u0431\u0430\u0432\u0438\u043B\u0438 (\u0438\u043B\u0438 \u0433\u0434\u0435 \u0432\u044B \u0430\u0434\u043C\u0438\u043D).",
++        "chat_stats_title": "\U0001F4CA <b>\u0417\u0430\u0433\u0440\u0443\u0437\u043A\u0438 \u0432 \u044D\u0442\u043E\u043C \u0447\u0430\u0442\u0435</b>",
++        "chat_stats_today": "\U0001F4C5 <b>\u0421\u0435\u0433\u043E\u0434\u043D\u044F</b>",
++        "chat_stats_alltime": "\U0001F5C2 <b>\u0417\u0430 \u0432\u0441\u0451 \u0432\u0440\u0435\u043C\u044F</b>",
++        "chat_stats_total_line": "\u2796 <b>\u0418\u0442\u043E\u0433\u043E: {n}</b>",
++        "chat_stats_zero": "\u2014 \u0437\u0430\u0433\u0440\u0443\u0437\u043E\u043A \u043F\u043E\u043A\u0430 \u043D\u0435\u0442",
++        "chat_stats_none": "\U0001F4CA <b>\u0417\u0430\u0433\u0440\u0443\u0437\u043A\u0438 \u0432 \u044D\u0442\u043E\u043C \u0447\u0430\u0442\u0435</b>\n\n\u041F\u043E\u043A\u0430 \u043D\u0435\u0442 \u0437\u0430\u0433\u0440\u0443\u0437\u043E\u043A. \u041E\u0442\u043F\u0440\u0430\u0432\u044C\u0442\u0435 \u0441\u0441\u044B\u043B\u043A\u0443 \u0441 YouTube, Instagram \u0438\u043B\u0438 TikTok!",
+         "analyzing": "\U0001F50D \u0410\u043D\u0430\u043B\u0438\u0437\u0438\u0440\u0443\u044E \u0441\u0441\u044B\u043B\u043A\u0443...",
+         "downloading": "\U0001F4E5 <b>\u0421\u043A\u0430\u0447\u0438\u0432\u0430\u044E...</b>\n\u23F3 \u042D\u0442\u043E \u043C\u043E\u0436\u0435\u0442 \u0437\u0430\u043D\u044F\u0442\u044C \u0432\u0440\u0435\u043C\u044F",
+         "uploading": "\U0001F4E4 \u0417\u0430\u0433\u0440\u0443\u0436\u0430\u044E \u0432 Telegram...",
+@@ -112,6 +157,23 @@ TRANSLATIONS = {
+         "btn_add_channel": "\u2795 \u0414\u043E\u0431\u0430\u0432\u0438\u0442\u044C \u0432 \u043A\u0430\u043D\u0430\u043B",
+         "add_group_help": "\U0001F465 <b>\u0414\u043E\u0431\u0430\u0432\u0438\u0442\u044C \u0431\u043E\u0442\u0430 \u0432 \u0433\u0440\u0443\u043F\u043F\u0443</b>\n\n1. \u041D\u0430\u0436\u043C\u0438\u0442\u0435 \u043A\u043D\u043E\u043F\u043A\u0443 \u043D\u0438\u0436\u0435\n2. \u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u0433\u0440\u0443\u043F\u043F\u0443 \u0438\u043B\u0438 \u043A\u0430\u043D\u0430\u043B\n3. \u0414\u0430\u0439\u0442\u0435 \u043F\u0440\u0430\u0432\u0430 \u0430\u0434\u043C\u0438\u043D\u0438\u0441\u0442\u0440\u0430\u0442\u043E\u0440\u0430\n\n\u2705 \u0411\u043E\u0442 \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u0435\u0441\u043A\u0438 \u0431\u0443\u0434\u0435\u0442 \u0441\u043A\u0430\u0447\u0438\u0432\u0430\u0442\u044C \u0432\u0438\u0434\u0435\u043E \u043F\u043E \u0441\u0441\u044B\u043B\u043A\u0430\u043C.",
+         "group_intro": "\U0001F44B <b>\u041F\u0440\u0438\u0432\u0435\u0442! \u042F \u0431\u043E\u0442 \u0434\u043B\u044F \u0441\u043A\u0430\u0447\u0438\u0432\u0430\u043D\u0438\u044F \u0432\u0438\u0434\u0435\u043E.</b>\n\n\u042F \u043A\u0430\u0447\u0430\u044E \u0432\u0438\u0434\u0435\u043E \u0441 \U0001F534 YouTube, \U0001F4F8 Instagram \u0438 \U0001F3B5 TikTok, \u0430 \u0442\u0430\u043A\u0436\u0435 \u0441\u0442\u043E\u0440\u0438\u0441 Instagram \u043F\u043E @username.\n\n\U0001F4AC <b>\u0412 \u0433\u0440\u0443\u043F\u043F\u0430\u0445</b> \u043F\u0440\u043E\u0441\u0442\u043E \u043E\u0442\u043F\u0440\u0430\u0432\u044C\u0442\u0435 \u043C\u043D\u0435 \u0441\u0441\u044B\u043B\u043A\u0443 \u2014 \u0438 \u044F \u0441\u043A\u0430\u0447\u0430\u044E.\n\n\u041A\u043E\u043C\u0430\u043D\u0434\u044B: /help /stats /buy /language\n\n\U0001F4E9 \u0414\u043B\u044F \u043F\u043E\u043B\u043D\u044B\u0445 \u0444\u0443\u043D\u043A\u0446\u0438\u0439 \u0438 \u043A\u043D\u043E\u043F\u043E\u043A \u043E\u0442\u043A\u0440\u043E\u0439\u0442\u0435 \u043C\u0435\u043D\u044F \u0432 <b>\u043B\u0438\u0447\u043D\u043E\u043C \u0447\u0430\u0442\u0435</b>.",
++        # ─── \u041C\u0435\u043D\u044E \u043D\u0430\u0441\u0442\u0440\u043E\u0435\u043A \u044E\u0437\u0435\u0440\u0430 ───
++        "btn_settings": "\u2699\uFE0F \u041D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0438",
++        "cmd_settings": "\u0412\u0430\u0448\u0438 \u043B\u0438\u0447\u043D\u044B\u0435 \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0438",
++        "settings_title": "\u2699\uFE0F <b>\u0412\u0430\u0448\u0438 \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0438</b>\n\n\u041D\u0430\u0441\u0442\u0440\u043E\u0439\u0442\u0435 \u0440\u0430\u0431\u043E\u0442\u0443 \u0431\u043E\u0442\u0430 \u043F\u043E\u0434 \u0441\u0435\u0431\u044F. \u041D\u0430\u0436\u043C\u0438\u0442\u0435 \u043D\u0430 \u043F\u0443\u043D\u043A\u0442, \u0447\u0442\u043E\u0431\u044B \u0438\u0437\u043C\u0435\u043D\u0438\u0442\u044C.",
++        "set_opt_language": "\U0001F310 \u042F\u0437\u044B\u043A",
++        "set_opt_tags": "#\uFE0F\u20E3 \u0425\u0435\u0448\u0442\u0435\u0433\u0438 \u0438\u0441\u0442\u043E\u0447\u043D\u0438\u043A\u0430",
++        "set_opt_channel": "\U0001F4E3 \u041A\u0430\u043D\u0430\u043B \u0438\u0441\u0442\u043E\u0447\u043D\u0438\u043A\u0430",
++        "set_opt_mode": "\U0001F3AC \u0420\u0435\u0436\u0438\u043C \u0437\u0430\u0433\u0440\u0443\u0437\u043A\u0438",
++        "opt_on": "\u2705 \u0412\u043A\u043B",
++        "opt_off": "\u274C \u0412\u044B\u043A\u043B",
++        "mode_ask": "\u2753 \u0421\u043F\u0440\u0430\u0448\u0438\u0432\u0430\u0442\u044C \u043A\u0430\u0436\u0434\u044B\u0439 \u0440\u0430\u0437",
++        "mode_video": "\U0001F3AC \u0412\u0438\u0434\u0435\u043E",
++        "mode_audio": "\U0001F3B5 \u0410\u0443\u0434\u0438\u043E",
++        "choose_mode": "\U0001F3AC <b>\u0420\u0435\u0436\u0438\u043C \u0437\u0430\u0433\u0440\u0443\u0437\u043A\u0438 \u043F\u043E \u0443\u043C\u043E\u043B\u0447\u0430\u043D\u0438\u044E</b>\n\n\u0427\u0442\u043E \u0434\u0435\u043B\u0430\u0442\u044C, \u043A\u043E\u0433\u0434\u0430 \u0432\u044B \u043E\u0442\u043F\u0440\u0430\u0432\u043B\u044F\u0435\u0442\u0435 \u0441\u0441\u044B\u043B\u043A\u0443:\n\u2022 <b>\u0421\u043F\u0440\u0430\u0448\u0438\u0432\u0430\u0442\u044C</b> \u2014 \u043F\u043E\u043A\u0430\u0437\u044B\u0432\u0430\u0442\u044C \u043A\u043D\u043E\u043F\u043A\u0438 \u043A\u0430\u0447\u0435\u0441\u0442\u0432\u0430/\u0444\u043E\u0440\u043C\u0430\u0442\u0430\n\u2022 <b>\u0412\u0438\u0434\u0435\u043E</b> \u2014 \u0441\u0440\u0430\u0437\u0443 \u0441\u043A\u0430\u0447\u0438\u0432\u0430\u0442\u044C \u0432\u0438\u0434\u0435\u043E\n\u2022 <b>\u0410\u0443\u0434\u0438\u043E</b> \u2014 \u0441\u0440\u0430\u0437\u0443 \u0441\u043A\u0430\u0447\u0438\u0432\u0430\u0442\u044C \u0430\u0443\u0434\u0438\u043E",
++        "btn_back": "\u2B05\uFE0F \u041D\u0430\u0437\u0430\u0434",
++        "btn_close": "\u2716\uFE0F \u0417\u0430\u043A\u0440\u044B\u0442\u044C",
++        "setting_saved": "\u2705 \u0421\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u043E",
+     },
+     "uk": {
+         "welcome": "\U0001F3AC <b>\u0417\u0430\u0432\u0430\u043D\u0442\u0430\u0436\u0443\u0432\u0430\u0447 \u0432\u0456\u0434\u0435\u043E</b>\n\n\u041D\u0430\u0434\u0456\u0448\u043B\u0438 \u043F\u043E\u0441\u0438\u043B\u0430\u043D\u043D\u044F \u0437 YouTube, Instagram \u0430\u0431\u043E TikTok, \u0430\u0431\u043E \u0432\u0432\u0435\u0434\u0438 @username \u0434\u043B\u044F \u0441\u0442\u043E\u0440\u0456\u0441 Instagram.\n\n\u0412\u0438\u043A\u043E\u0440\u0438\u0441\u0442\u043E\u0432\u0443\u0439 \u043A\u043D\u043E\u043F\u043A\u0438 \u043D\u0438\u0436\u0447\u0435.",
+@@ -124,6 +186,20 @@ TRANSLATIONS = {
+         "choose_language": "\U0001F310 \u041E\u0431\u0435\u0440\u0456\u0442\u044C \u043C\u043E\u0432\u0443:",
+         "language_set": "\u2705 \u041C\u043E\u0432\u0430: \u0423\u043A\u0440\u0430\u0457\u043D\u0441\u044C\u043A\u0430.",
+         "feature_disabled": "\u26A0\uFE0F \u0426\u044F \u0444\u0443\u043D\u043A\u0446\u0456\u044F \u0432\u0438\u043C\u043A\u043D\u0435\u043D\u0430 \u0430\u0434\u043C\u0456\u043D\u043E\u043C.",
++        "lang_admins_only": "\u26D4\uFE0F \u0417\u043C\u0456\u043D\u044E\u0432\u0430\u0442\u0438 \u043C\u043E\u0432\u0443 \u0442\u0443\u0442 \u043C\u043E\u0436\u0443\u0442\u044C \u043B\u0438\u0448\u0435 \u0430\u0434\u043C\u0456\u043D\u0438 \u0433\u0440\u0443\u043F\u0438.",
++        "btn_my_groups": "\U0001F465 \u041C\u043E\u0457 \u0433\u0440\u0443\u043F\u0438",
++        "cmd_mygroups": "\u041D\u0430\u043B\u0430\u0448\u0442\u0443\u0432\u0430\u0442\u0438 \u0432\u0430\u0448\u0456 \u0433\u0440\u0443\u043F\u0438",
++        "my_groups_title": "\U0001F465 <b>\u0412\u0430\u0448\u0456 \u0433\u0440\u0443\u043F\u0438 \u0442\u0430 \u043A\u0430\u043D\u0430\u043B\u0438</b>\n\n\u0426\u0435 \u0447\u0430\u0442\u0438, \u043A\u0443\u0434\u0438 \u0432\u0438 \u043C\u0435\u043D\u0435 \u0434\u043E\u0434\u0430\u043B\u0438. \u041D\u0430\u0442\u0438\u0441\u043D\u0456\u0442\u044C \u043D\u0430 \u0447\u0430\u0442, \u0449\u043E\u0431 \u043D\u0430\u043B\u0430\u0448\u0442\u0443\u0432\u0430\u0442\u0438.",
++        "my_groups_empty": "\U0001F465 <b>\u0412\u0430\u0448\u0456 \u0433\u0440\u0443\u043F\u0438 \u0442\u0430 \u043A\u0430\u043D\u0430\u043B\u0438</b>\n\n\u0412\u0438 \u0449\u0435 \u043D\u0435 \u0434\u043E\u0434\u0430\u043B\u0438 \u043C\u0435\u043D\u0435 \u0434\u043E \u0436\u043E\u0434\u043D\u043E\u0457 \u0433\u0440\u0443\u043F\u0438 \u0447\u0438 \u043A\u0430\u043D\u0430\u043B\u0443.\n\u0414\u043E\u0434\u0430\u0439\u0442\u0435 \u043C\u0435\u043D\u0435 \u0442\u0430 \u043F\u043E\u0432\u0435\u0440\u043D\u0456\u0442\u044C\u0441\u044F \u0441\u044E\u0434\u0438 \u0434\u043B\u044F \u043D\u0430\u043B\u0430\u0448\u0442\u0443\u0432\u0430\u043D\u043D\u044F.",
++        "group_settings_title": "\u2699\uFE0F <b>{title}</b>\n\n\u041D\u0430\u043B\u0430\u0448\u0442\u0443\u0439\u0442\u0435, \u044F\u043A \u044F \u043F\u0440\u0430\u0446\u044E\u044E \u0432 \u0446\u044C\u043E\u043C\u0443 \u0447\u0430\u0442\u0456. \u041D\u0430\u0442\u0438\u0441\u043D\u0456\u0442\u044C \u043D\u0430 \u043F\u0443\u043D\u043A\u0442, \u0449\u043E\u0431 \u0437\u043C\u0456\u043D\u0438\u0442\u0438.",
++        "set_opt_delete_url": "\U0001F5D1 \u0412\u0438\u0434\u0430\u043B\u044F\u0442\u0438 \u043F\u043E\u0441\u0438\u043B\u0430\u043D\u043D\u044F \u044E\u0437\u0435\u0440\u0430",
++        "group_no_access": "\u26D4\uFE0F \u041D\u0430\u043B\u0430\u0448\u0442\u043E\u0432\u0443\u0432\u0430\u0442\u0438 \u043C\u043E\u0436\u043D\u0430 \u043B\u0438\u0448\u0435 \u0433\u0440\u0443\u043F\u0438, \u043A\u0443\u0434\u0438 \u0432\u0438 \u043C\u0435\u043D\u0435 \u0434\u043E\u0434\u0430\u043B\u0438 (\u0430\u0431\u043E \u0434\u0435 \u0432\u0438 \u0430\u0434\u043C\u0456\u043D).",
++        "chat_stats_title": "\U0001F4CA <b>\u0417\u0430\u0432\u0430\u043D\u0442\u0430\u0436\u0435\u043D\u043D\u044F \u0432 \u0446\u044C\u043E\u043C\u0443 \u0447\u0430\u0442\u0456</b>",
++        "chat_stats_today": "\U0001F4C5 <b>\u0421\u044C\u043E\u0433\u043E\u0434\u043D\u0456</b>",
++        "chat_stats_alltime": "\U0001F5C2 <b>\u0417\u0430 \u0432\u0435\u0441\u044C \u0447\u0430\u0441</b>",
++        "chat_stats_total_line": "\u2796 <b>\u0420\u0430\u0437\u043E\u043C: {n}</b>",
++        "chat_stats_zero": "\u2014 \u0437\u0430\u0432\u0430\u043D\u0442\u0430\u0436\u0435\u043D\u044C \u0449\u0435 \u043D\u0435\u043C\u0430\u0454",
++        "chat_stats_none": "\U0001F4CA <b>\u0417\u0430\u0432\u0430\u043D\u0442\u0430\u0436\u0435\u043D\u043D\u044F \u0432 \u0446\u044C\u043E\u043C\u0443 \u0447\u0430\u0442\u0456</b>\n\n\u0429\u0435 \u043D\u0435\u043C\u0430\u0454 \u0437\u0430\u0432\u0430\u043D\u0442\u0430\u0436\u0435\u043D\u044C. \u041D\u0430\u0434\u0456\u0448\u043B\u0456\u0442\u044C \u043F\u043E\u0441\u0438\u043B\u0430\u043D\u043D\u044F \u0437 YouTube, Instagram \u0430\u0431\u043E TikTok!",
+         "analyzing": "\U0001F50D \u0410\u043D\u0430\u043B\u0456\u0437\u0443\u044E \u043F\u043E\u0441\u0438\u043B\u0430\u043D\u043D\u044F...",
+         "downloading": "\U0001F4E5 <b>\u0417\u0430\u0432\u0430\u043D\u0442\u0430\u0436\u0443\u044E...</b>\n\u23F3 \u0426\u0435 \u043C\u043E\u0436\u0435 \u0437\u0430\u0439\u043D\u044F\u0442\u0438 \u0447\u0430\u0441",
+         "uploading": "\U0001F4E4 \u0417\u0430\u0432\u0430\u043D\u0442\u0430\u0436\u0443\u044E \u0432 Telegram...",
+@@ -165,6 +241,23 @@ TRANSLATIONS = {
+         "btn_add_channel": "\u2795 \u0414\u043E\u0434\u0430\u0442\u0438 \u0432 \u043A\u0430\u043D\u0430\u043B",
+         "add_group_help": "\U0001F465 <b>\u0414\u043E\u0434\u0430\u0442\u0438 \u0431\u043E\u0442\u0430 \u0432 \u0433\u0440\u0443\u043F\u0443\u003c/b>\n\n1. \u041D\u0430\u0442\u0438\u0441\u043D\u0456\u0442\u044C \u043A\u043D\u043E\u043F\u043A\u0443 \u043D\u0438\u0436\u0447\u0435\n2. \u041E\u0431\u0435\u0440\u0456\u0442\u044C \u0433\u0440\u0443\u043F\u0443 \u0430\u0431\u043E \u043A\u0430\u043D\u0430\u043B\n3. \u0414\u0430\u0439\u0442\u0435 \u043F\u0440\u0430\u0432\u0430 \u0430\u0434\u043C\u0456\u043D\u0456\u0441\u0442\u0440\u0430\u0442\u043E\u0440\u0430\n\n\u2705 \u0411\u043E\u0442 \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u043D\u043E \u0437\u0430\u0432\u0430\u043D\u0442\u0430\u0436\u0438\u0442\u0438\u043C\u0435 \u0432\u0456\u0434\u0435\u043E \u0437 \u043F\u043E\u0441\u0438\u043B\u0430\u043D\u044C.",
+         "group_intro": "\U0001F44B <b>\u041F\u0440\u0438\u0432\u0456\u0442! \u042F \u0431\u043E\u0442 \u0434\u043B\u044F \u0437\u0430\u0432\u0430\u043D\u0442\u0430\u0436\u0435\u043D\u043D\u044F \u0432\u0456\u0434\u0435\u043E.</b>\n\n\u042F \u0437\u0430\u0432\u0430\u043D\u0442\u0430\u0436\u0443\u044E \u0432\u0456\u0434\u0435\u043E \u0437 \U0001F534 YouTube, \U0001F4F8 Instagram \u0456 \U0001F3B5 TikTok, \u0430 \u0442\u0430\u043A\u043E\u0436 \u0441\u0442\u043E\u0440\u0456\u0441 Instagram \u0437\u0430 @username.\n\n\U0001F4AC <b>\u0423 \u0433\u0440\u0443\u043F\u0430\u0445</b> \u043F\u0440\u043E\u0441\u0442\u043E \u043D\u0430\u0434\u0456\u0448\u043B\u0456\u0442\u044C \u043C\u0435\u043D\u0456 \u043F\u043E\u0441\u0438\u043B\u0430\u043D\u043D\u044F \u2014 \u0456 \u044F \u0437\u0430\u0432\u0430\u043D\u0442\u0430\u0436\u0443.\n\n\u041A\u043E\u043C\u0430\u043D\u0434\u0438: /help /stats /buy /language\n\n\U0001F4E9 \u0414\u043B\u044F \u043F\u043E\u0432\u043D\u0438\u0445 \u0444\u0443\u043D\u043A\u0446\u0456\u0439 \u0456 \u043A\u043D\u043E\u043F\u043E\u043A \u0432\u0456\u0434\u043A\u0440\u0438\u0439\u0442\u0435 \u043C\u0435\u043D\u0435 \u0432 <b>\u043F\u0440\u0438\u0432\u0430\u0442\u043D\u043E\u043C\u0443 \u0447\u0430\u0442\u0456</b>.",
++        # ─── \u041C\u0435\u043D\u044E \u043D\u0430\u043B\u0430\u0448\u0442\u0443\u0432\u0430\u043D\u044C \u043A\u043E\u0440\u0438\u0441\u0442\u0443\u0432\u0430\u0447\u0430 ───
++        "btn_settings": "\u2699\uFE0F \u041D\u0430\u043B\u0430\u0448\u0442\u0443\u0432\u0430\u043D\u043D\u044F",
++        "cmd_settings": "\u0412\u0430\u0448\u0456 \u043E\u0441\u043E\u0431\u0438\u0441\u0442\u0456 \u043D\u0430\u043B\u0430\u0448\u0442\u0443\u0432\u0430\u043D\u043D\u044F",
++        "settings_title": "\u2699\uFE0F <b>\u0412\u0430\u0448\u0456 \u043D\u0430\u043B\u0430\u0448\u0442\u0443\u0432\u0430\u043D\u043D\u044F</b>\n\n\u041D\u0430\u043B\u0430\u0448\u0442\u0443\u0439\u0442\u0435 \u0440\u043E\u0431\u043E\u0442\u0443 \u0431\u043E\u0442\u0430 \u043F\u0456\u0434 \u0441\u0435\u0431\u0435. \u041D\u0430\u0442\u0438\u0441\u043D\u0456\u0442\u044C \u043D\u0430 \u043F\u0443\u043D\u043A\u0442, \u0449\u043E\u0431 \u0437\u043C\u0456\u043D\u0438\u0442\u0438.",
++        "set_opt_language": "\U0001F310 \u041C\u043E\u0432\u0430",
++        "set_opt_tags": "#\uFE0F\u20E3 \u0425\u0435\u0448\u0442\u0435\u0433\u0438 \u0434\u0436\u0435\u0440\u0435\u043B\u0430",
++        "set_opt_channel": "\U0001F4E3 \u041A\u0430\u043D\u0430\u043B \u0434\u0436\u0435\u0440\u0435\u043B\u0430",
++        "set_opt_mode": "\U0001F3AC \u0420\u0435\u0436\u0438\u043C \u0437\u0430\u0432\u0430\u043D\u0442\u0430\u0436\u0435\u043D\u043D\u044F",
++        "opt_on": "\u2705 \u0423\u0432\u0456\u043C\u043A.",
++        "opt_off": "\u274C \u0412\u0438\u043C\u043A.",
++        "mode_ask": "\u2753 \u041F\u0438\u0442\u0430\u0442\u0438 \u0449\u043E\u0440\u0430\u0437\u0443",
++        "mode_video": "\U0001F3AC \u0412\u0456\u0434\u0435\u043E",
++        "mode_audio": "\U0001F3B5 \u0410\u0443\u0434\u0456\u043E",
++        "choose_mode": "\U0001F3AC <b>\u0420\u0435\u0436\u0438\u043C \u0437\u0430\u0432\u0430\u043D\u0442\u0430\u0436\u0435\u043D\u043D\u044F \u0437\u0430 \u0437\u0430\u043C\u043E\u0432\u0447\u0443\u0432\u0430\u043D\u043D\u044F\u043C</b>\n\n\u0429\u043E \u0440\u043E\u0431\u0438\u0442\u0438, \u043A\u043E\u043B\u0438 \u0432\u0438 \u043D\u0430\u0434\u0441\u0438\u043B\u0430\u0454\u0442\u0435 \u043F\u043E\u0441\u0438\u043B\u0430\u043D\u043D\u044F:\n\u2022 <b>\u041F\u0438\u0442\u0430\u0442\u0438</b> \u2014 \u043F\u043E\u043A\u0430\u0437\u0443\u0432\u0430\u0442\u0438 \u043A\u043D\u043E\u043F\u043A\u0438 \u044F\u043A\u043E\u0441\u0442\u0456/\u0444\u043E\u0440\u043C\u0430\u0442\u0443\n\u2022 <b>\u0412\u0456\u0434\u0435\u043E</b> \u2014 \u0432\u0456\u0434\u0440\u0430\u0437\u0443 \u0437\u0430\u0432\u0430\u043D\u0442\u0430\u0436\u0443\u0432\u0430\u0442\u0438 \u0432\u0456\u0434\u0435\u043E\n\u2022 <b>\u0410\u0443\u0434\u0456\u043E</b> \u2014 \u0432\u0456\u0434\u0440\u0430\u0437\u0443 \u0437\u0430\u0432\u0430\u043D\u0442\u0430\u0436\u0443\u0432\u0430\u0442\u0438 \u0430\u0443\u0434\u0456\u043E",
++        "btn_back": "\u2B05\uFE0F \u041D\u0430\u0437\u0430\u0434",
++        "btn_close": "\u2716\uFE0F \u0417\u0430\u043A\u0440\u0438\u0442\u0438",
++        "setting_saved": "\u2705 \u0417\u0431\u0435\u0440\u0435\u0436\u0435\u043D\u043E",
+     },
+ }
+ 
+diff --git a/services/i18n_admin.py b/services/i18n_admin.py
+index 4c7f13e..35026ff 100644
+--- a/services/i18n_admin.py
++++ b/services/i18n_admin.py
+@@ -56,6 +56,7 @@ ADMIN = {
+         "set_stars": "\u2B50 Stars / Buy",
+         "set_bulk": "\U0001F4E6 Bulk Stories",
+         "set_lang": "\U0001F310 Language select",
++        "set_user_settings": "\u2699\uFE0F User settings menu",
+         "set_group_buttons": "\U0001F465 Buttons in groups",
+         "set_show_tags": "\U0001F3F7 Source hashtags",
+         "set_show_source_channel": "\U0001F4E3 Source channel",
+@@ -119,6 +120,7 @@ ADMIN = {
+         "set_stars": "\u2B50 Stars / \u041F\u043E\u043A\u0443\u043F\u043A\u0430",
+         "set_bulk": "\U0001F4E6 \u041C\u0430\u0441\u0441\u043E\u0432\u044B\u0435 \u0441\u0442\u043E\u0440\u0438\u0441",
+         "set_lang": "\U0001F310 \u0412\u044B\u0431\u043E\u0440 \u044F\u0437\u044B\u043A\u0430",
++        "set_user_settings": "\u2699\uFE0F \u041C\u0435\u043D\u044E \u043D\u0430\u0441\u0442\u0440\u043E\u0435\u043A \u044E\u0437\u0435\u0440\u0430",
+         "set_group_buttons": "\U0001F465 \u041A\u043D\u043E\u043F\u043A\u0438 \u0432 \u0433\u0440\u0443\u043F\u043F\u0430\u0445",
+         "set_show_tags": "\U0001F3F7 \u0425\u044D\u0448\u0442\u0435\u0433\u0438 \u0438\u0441\u0442\u043E\u0447\u043D\u0438\u043A\u0430",
+         "set_show_source_channel": "\U0001F4E3 \u041A\u0430\u043D\u0430\u043B \u0438\u0441\u0442\u043E\u0447\u043D\u0438\u043A\u0430",
+@@ -182,6 +184,7 @@ ADMIN = {
+         "set_stars": "\u2B50 Stars / \u041F\u043E\u043A\u0443\u043F\u043A\u0430",
+         "set_bulk": "\U0001F4E6 \u041C\u0430\u0441\u043E\u0432\u0456 \u0441\u0442\u043E\u0440\u0456\u0441",
+         "set_lang": "\U0001F310 \u0412\u0438\u0431\u0456\u0440 \u043C\u043E\u0432\u0438",
++        "set_user_settings": "\u2699\uFE0F \u041C\u0435\u043D\u044E \u043D\u0430\u043B\u0430\u0448\u0442\u0443\u0432\u0430\u043D\u044C \u043A\u043E\u0440\u0438\u0441\u0442\u0443\u0432\u0430\u0447\u0430",
+         "set_group_buttons": "\U0001F465 \u041A\u043D\u043E\u043F\u043A\u0438 \u0432 \u0433\u0440\u0443\u043F\u0430\u0445",
+         "set_show_tags": "\U0001F3F7 \u0425\u0435\u0448\u0442\u0435\u0491\u0438 \u0434\u0436\u0435\u0440\u0435\u043B\u0430",
+         "set_show_source_channel": "\U0001F4E3 \u041A\u0430\u043D\u0430\u043B \u0434\u0436\u0435\u0440\u0435\u043B\u0430",
