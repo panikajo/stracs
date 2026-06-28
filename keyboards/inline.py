@@ -215,7 +215,7 @@ def settings_keyboard(lang: str, settings: dict) -> InlineKeyboardMarkup:
             callback_data="uset:caption",
         )],
         [InlineKeyboardButton(
-            text=f"{tr(lang, 'set_opt_desc')}: {tr(lang, _DESC_KEYS.get(settings.get('description_mode', 'off'), 'desc_off'))}",
+            text=f"{tr(lang, 'set_opt_desc')} ▸",
             callback_data="uset:desc",
         )],
         [InlineKeyboardButton(
@@ -277,8 +277,16 @@ def settings_caption_keyboard(lang: str, current: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+_PLATFORM_LABELS = {
+    "instagram": "📷 Instagram",
+    "tiktok": "🎵 TikTok",
+    "threads": "🧵 Threads",
+    "youtube": "▶️ YouTube",
+}
+
+
 def settings_description_keyboard(lang: str, current: str) -> InlineKeyboardMarkup:
-    """Picker for how the post description/text is delivered."""
+    """Picker for how the post description/text is delivered (legacy, single mode)."""
     mark = "\u2713 "
     rows = []
     for mode, key in (
@@ -294,6 +302,53 @@ def settings_description_keyboard(lang: str, current: str) -> InlineKeyboardMark
             callback_data=f"uset:setdesc:{mode}",
         )])
     rows.append([InlineKeyboardButton(text=tr(lang, "btn_back"), callback_data="uset:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def settings_desc_platforms_keyboard(lang: str, settings: dict) -> InlineKeyboardMarkup:
+    """Per-platform description mode picker — lists platforms with their current mode."""
+    # Show which global mode per-platform inherits when set to "default"
+    global_mode = settings.get("description_mode", "off")
+    global_label = tr(lang, _DESC_KEYS.get(global_mode, "desc_off"))
+
+    rows = []
+    for plat, label in _PLATFORM_LABELS.items():
+        col = f"desc_mode_{plat}"
+        cur = settings.get(col, "default")
+        if cur == "default":
+            mode_label = f"⬜ ({global_label})"
+        else:
+            mode_label = tr(lang, _DESC_KEYS.get(cur, "desc_off"))
+        rows.append([InlineKeyboardButton(
+            text=f"{label}: {mode_label}",
+            callback_data=f"uset:descplat:{plat}",
+        )])
+    rows.append([InlineKeyboardButton(text=tr(lang, "btn_back"), callback_data="uset:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def settings_desc_platform_mode_keyboard(lang: str, platform: str, current: str) -> InlineKeyboardMarkup:
+    """Mode picker for a specific platform's description setting."""
+    mark = "\u2713 "
+    rows = []
+    # "default" = inherit global setting
+    prefix = mark if current == "default" else ""
+    rows.append([InlineKeyboardButton(
+        text=f"{prefix}⬜ По умолчанию (общая)",
+        callback_data=f"uset:setdescplat:{platform}:default",
+    )])
+    for mode, key in (
+        ("off", "desc_off"),
+        ("separate", "desc_separate"),
+        ("with", "desc_with"),
+        ("quote", "desc_quote"),
+    ):
+        prefix = mark if current == mode else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{prefix}{tr(lang, key)}",
+            callback_data=f"uset:setdescplat:{platform}:{mode}",
+        )])
+    rows.append([InlineKeyboardButton(text=tr(lang, "btn_back"), callback_data="uset:desc")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

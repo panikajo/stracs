@@ -172,6 +172,51 @@ class ThreadsIE(InfoExtractor):
             if fmt_url and not any(fmt['url'] == fmt_url for fmt in formats):
                 formats.append({'url': fmt_url})
 
+        # ── Audio / music track extraction ──
+        # Threads posts can attach a background song clip. The Relay JSON stores
+        # it under `music_info.music_asset_info` (with a direct download URL) or
+        # as lighter metadata in `clips_music_attribution_info`.
+        audio_url = (
+            traverse_obj(media, ('music_info', 'music_asset_info',
+                                 'fast_start_progressive_download_url'),
+                         expected_type=url_or_none)
+            or traverse_obj(media, ('music_info', 'music_asset_info',
+                                    'progressive_download_url'),
+                            expected_type=url_or_none)
+        )
+        audio_title = traverse_obj(
+            media, ('music_info', 'music_asset_info', 'title'),
+            expected_type=str_or_none,
+        )
+        audio_artist = (
+            traverse_obj(media, ('music_info', 'music_asset_info',
+                                 'display_artist'), expected_type=str_or_none)
+            or traverse_obj(media, ('music_info', 'music_asset_info',
+                                    'subtitle'), expected_type=str_or_none)
+        )
+        # Lighter fallback: clips_music_attribution_info (no URL, just metadata)
+        if not audio_title:
+            audio_title = traverse_obj(
+                media, ('clips_music_attribution_info', 'song_name'),
+                expected_type=str_or_none,
+            )
+        if not audio_artist:
+            audio_artist = traverse_obj(
+                media, ('clips_music_attribution_info', 'artist_name'),
+                expected_type=str_or_none,
+            )
+        audio_cover = (
+            traverse_obj(media, ('music_info', 'music_asset_info',
+                                 'cover_artwork_uri'), expected_type=url_or_none)
+            or traverse_obj(media, ('music_info', 'music_asset_info',
+                                    'cover_artwork_thumbnail_uri'),
+                            expected_type=url_or_none)
+        )
+        audio_duration_ms = traverse_obj(
+            media, ('music_info', 'music_asset_info', 'duration_in_ms'),
+            expected_type=int_or_none,
+        )
+
         info = {
             'id': str_or_none(media.get('code') or media.get('pk') or media.get('id')) or media_id,
             'title': description or f'Threads post {media_id}',
@@ -185,6 +230,16 @@ class ThreadsIE(InfoExtractor):
             'like_count': int_or_none(media.get('like_count')),
             'comment_count': int_or_none(media.get('comment_count')),
         }
+        if audio_url:
+            info['audio_url'] = audio_url
+        if audio_title:
+            info['audio_title'] = audio_title
+        if audio_artist:
+            info['audio_artist'] = audio_artist
+        if audio_cover:
+            info['audio_cover'] = audio_cover
+        if audio_duration_ms:
+            info['audio_duration_ms'] = audio_duration_ms
 
         if formats:
             return {
@@ -362,15 +417,27 @@ class ThreadsIE(InfoExtractor):
         for media in media_candidates:
             add_entry(media)
 
+        # Collect audio info from entries (parent media carries music_info;
+        # _extract_media_object already parses it into audio_* keys).
+        _audio_keys = ('audio_url', 'audio_title', 'audio_artist',
+                       'audio_cover', 'audio_duration_ms')
+        broad_audio = {}
+        for e in entries:
+            for _akey in _audio_keys:
+                if not broad_audio.get(_akey) and e.get(_akey):
+                    broad_audio[_akey] = e[_akey]
+
         if len(entries) == 1:
             return entries[0]
         if entries:
-            return {
+            result = {
                 '_type': 'playlist',
                 'id': shortcode,
                 'title': f'Threads post {shortcode}',
                 'entries': entries,
             }
+            result.update(broad_audio)
+            return result
         return None
 
     def _extract_public_media(self, webpage, shortcode):
@@ -426,7 +493,19 @@ class ThreadsIE(InfoExtractor):
                 collect_target_media(script_json)
 
         entries = []
+        # Collect audio info from the *parent* media (carousel children rarely
+        # carry it). We'll promote it to the playlist/entry dict later.
+        parent_audio = {}
         for media in target_media:
+            # Grab audio from first parent that has it
+            if not parent_audio:
+                _tmp = self._extract_media_object(media, '__probe__')
+                if _tmp:
+                    for _akey in ('audio_url', 'audio_title', 'audio_artist',
+                                  'audio_cover', 'audio_duration_ms'):
+                        if _tmp.get(_akey):
+                            parent_audio[_akey] = _tmp[_akey]
+
             carousel_media = media.get('carousel_media')
             if carousel_media:
                 for idx, child_media in enumerate(carousel_media, start=1):
@@ -445,13 +524,17 @@ class ThreadsIE(InfoExtractor):
             return None
 
         if len(entries) == 1:
-            return entries[0]
-        return {
+            result = entries[0]
+            result.update({k: v for k, v in parent_audio.items() if k not in result})
+            return result
+        result = {
             '_type': 'playlist',
             'id': shortcode,
             'title': f'Threads post {shortcode}',
             'entries': entries,
         }
+        result.update(parent_audio)
+        return result
 
     def _real_extract(self, url):
         mobj = self._match_valid_url(url)

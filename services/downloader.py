@@ -10,8 +10,8 @@ from config import config
 import shutil
 import sys
 
-
-
+# Project root — all relative paths (plugins/, cookies/) resolve from here.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 
@@ -52,7 +52,7 @@ def _threads_is_ytdlp_cmd(parts):
 
 
 def _threads_prepare_yt_dlp_cli_cmd(cmd):
-    """Normalize Threads URLs and add --plugin-dirs plugins to yt-dlp CLI calls."""
+    """Normalize Threads URLs and add --plugin-dirs to yt-dlp CLI calls."""
     try:
         import os as _os
         from pathlib import Path as _Path
@@ -61,13 +61,15 @@ def _threads_prepare_yt_dlp_cli_cmd(cmd):
             if not _threads_is_ytdlp_cmd(parts):
                 return cmd
             # Add plugin dir only if local plugin exists and not already specified.
-            plugin_file = _Path("plugins/threads/yt_dlp_plugins/extractor/threads.py")
+            # Use absolute path so it works regardless of working directory.
+            plugin_dir_abs = _os.path.join(_PROJECT_ROOT, "plugins")
+            plugin_file = _Path(_os.path.join(plugin_dir_abs, "threads", "yt_dlp_plugins", "extractor", "threads.py"))
             if plugin_file.exists() and "--plugin-dirs" not in parts:
                 insert_at = 1
                 # For `python -m yt_dlp ...`, insert after module name.
                 if len(parts) >= 3 and parts[1] == "-m" and parts[2] in ("yt_dlp", "yt-dlp"):
                     insert_at = 3
-                parts[insert_at:insert_at] = ["--plugin-dirs", "plugins"]
+                parts[insert_at:insert_at] = ["--plugin-dirs", plugin_dir_abs]
             parts = [_threads_normalize_cli_url(x) if "threads." in str(x).lower() else x for x in parts]
             return tuple(parts) if isinstance(cmd, tuple) else parts
         if isinstance(cmd, str) and ("yt-dlp" in cmd or "yt_dlp" in cmd) and "threads." in cmd:
@@ -76,9 +78,10 @@ def _threads_prepare_yt_dlp_cli_cmd(cmd):
             cmd = _re.sub(r"&lt;", "<", cmd)
             cmd = _re.sub(r"&gt;", ">", cmd)
             cmd = _re.sub(r"['\"]?<(?P<url>https?://(?:www\.)?threads\.(?:com|net)/[^>\s'\"]+)>['\"]?", lambda m: _threads_normalize_cli_url(m.group('url')), cmd)
-            if "--plugin-dirs" not in cmd and _Path("plugins/threads/yt_dlp_plugins/extractor/threads.py").exists():
-                cmd = cmd.replace("yt-dlp ", "yt-dlp --plugin-dirs plugins ", 1)
-                cmd = cmd.replace("yt_dlp ", "yt_dlp --plugin-dirs plugins ", 1)
+            _abs_plugin_dir = _os.path.join(_PROJECT_ROOT, "plugins")
+            if "--plugin-dirs" not in cmd and _Path(_os.path.join(_abs_plugin_dir, "threads", "yt_dlp_plugins", "extractor", "threads.py")).exists():
+                cmd = cmd.replace("yt-dlp ", f"yt-dlp --plugin-dirs {_abs_plugin_dir} ", 1)
+                cmd = cmd.replace("yt_dlp ", f"yt_dlp --plugin-dirs {_abs_plugin_dir} ", 1)
             return cmd
     except Exception:
         return cmd
@@ -140,110 +143,6 @@ def _threads_install_cli_plugin_patch():
 
 _threads_install_cli_plugin_patch()
 # --- /Threads yt-dlp CLI plugin support ---
-
-def _force_enable_threads_ytdlp_plugin() -> None:
-    """Load local ./plugins yt-dlp extractors, especially ThreadsIE."""
-    try:
-        from pathlib import Path as _Path
-        from yt_dlp.globals import plugin_dirs as _plugin_dirs
-        import yt_dlp.plugins as _plugins
-        _root = _Path("plugins")
-        if not _root.exists():
-            return
-        _current = list(_plugin_dirs.value or [])
-        if str(_root) not in _current:
-            _plugin_dirs.value = [str(_root)] + _current
-        _plugins.load_all_plugins()
-    except Exception:
-        pass
-
-
-def _normalize_threads_url_for_ytdlp(url: str) -> str:
-    """Canonicalize Threads URLs before passing to yt-dlp."""
-    try:
-        import re as _re
-        u = str(url or "").replace("&lt;", "<").replace("&gt;", ">").strip().strip("'\"").strip().strip("<>").strip()
-        if u.startswith("http") and "|" in u:
-            u = u.split("|", 1)[0].strip("<>").strip()
-        m = _re.search(r"https?://(?:www\.)?threads\.(?:com|net)/(?:@(?P<username>[^/?#>]+)/(?:post|media)/|t/)(?P<id>[A-Za-z0-9_-]+)", u, _re.I)
-        if m:
-            username = m.group("username")
-            shortcode = m.group("id")
-            if username:
-                return f"https://www.threads.net/@{username}/post/{shortcode}"
-            return f"https://www.threads.net/t/{shortcode}"
-        return u
-    except Exception:
-        return url
-
-def _apply_site_cookie_opts(opts: dict, url: str = None, platform: str = None) -> dict:
-    """Apply cookies/user-agent to yt-dlp opts when available.
-
-    Supports:
-      - YouTube: cookies/youtube.txt, cookies/google.txt, youtube.txt
-      - Instagram: cookies/instagram.txt, cookies/cookies.txt, instagram.txt
-      - Threads: cookies/threads.txt, cookies/instagram.txt, cookies/meta.txt
-    """
-    try:
-        from pathlib import Path as _Path
-        target = ((platform or "") + " " + (url or "")).lower()
-        cookie_candidates = []
-        if "youtube" in target or "youtu.be" in target:
-            cookie_candidates = [_Path("cookies/youtube.txt"), _Path("cookies/google.txt"), _Path("youtube.txt"), _Path("cookies/cookies.txt")]
-            opts.setdefault("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
-        elif "threads" in target:
-            cookie_candidates = [_Path("cookies/threads.txt"), _Path("cookies/instagram.txt"), _Path("cookies/meta.txt"), _Path("cookies/cookies.txt")]
-            opts.setdefault("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
-        elif "instagram" in target:
-            cookie_candidates = [_Path("cookies/instagram.txt"), _Path("cookies/cookies.txt"), _Path("instagram.txt")]
-            opts.setdefault("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0")
-        for _cookie in cookie_candidates:
-            if _cookie.exists() and _cookie.stat().st_size > 0:
-                opts.setdefault("cookiefile", str(_cookie))
-                break
-        headers = opts.setdefault("http_headers", {})
-        headers.setdefault("Accept-Language", "en-US,en;q=0.9,ru;q=0.8")
-    except Exception:
-        pass
-    return opts
-
-def _enable_threads_ytdlp_plugin() -> None:
-    """Enable local yt-dlp Threads extractor plugin from ./plugins.
-
-    Required when installed yt-dlp prints:
-      [generic] Extracting URL ... ERROR: Unsupported URL
-    """
-    try:
-        from pathlib import Path as _Path
-        from yt_dlp.globals import plugin_dirs as _plugin_dirs
-        import yt_dlp.plugins as _plugins
-        _root = _Path("plugins")
-        if not _root.exists():
-            return
-        _current = list(_plugin_dirs.value or [])
-        if str(_root) not in _current:
-            _plugin_dirs.value = [str(_root)] + _current
-        _plugins.load_all_plugins()
-    except Exception:
-        pass
-
-def _normalize_threads_url_for_ytdlp(url: str) -> str:
-    """Canonicalize Threads URLs for yt-dlp.
-
-    Converts Slack-style <url>, threads.com, and tracking params into:
-      https://www.threads.net/@user/post/POST_ID
-    """
-    try:
-        import re as _re
-        u = str(url or "").strip().strip("<>").strip()
-        if u.startswith("http") and "|" in u:
-            u = u.split("|", 1)[0].strip("<>")
-        m = _re.search(r"https?://(?:www\.)?threads\.(?:com|net)/(@[^/]+)/(post|media)/([^/?#>]+)", u, _re.I)
-        if m:
-            return f"https://www.threads.net/{m.group(1)}/{m.group(2)}/{m.group(3)}"
-        return u
-    except Exception:
-        return url
 
 logger = logging.getLogger("smdownbot.downloader")
 
@@ -324,6 +223,34 @@ class DownloadResult:
     source_url: Optional[str] = None
     uploader_id: Optional[str] = None
     tags: Optional[list] = None
+    description: Optional[str] = None
+    audio_url: Optional[str] = None
+    audio_title: Optional[str] = None
+    audio_artist: Optional[str] = None
+
+def _find_cookie_file(platform: str) -> Optional[str]:
+    """Find the best cookie file for a platform, with fallbacks.
+
+    Threads uses Instagram/Meta auth, so cookies/instagram.txt works as a
+    fallback when cookies/threads.txt does not exist.
+    """
+    if platform == "tiktok":
+        # TikTok: do NOT attach cookies — yt-dlp's challenge solver sets its own
+        # short-lived cookies, and user cookies break them.
+        return None
+    candidates = [os.path.join(config.COOKIES_DIR, f"{platform}.txt")]
+    if platform == "threads":
+        # Threads shares auth with Instagram (Meta). Fall back to IG cookies.
+        candidates.extend([
+            os.path.join(config.COOKIES_DIR, "instagram.txt"),
+            os.path.join(config.COOKIES_DIR, "meta.txt"),
+            os.path.join(config.COOKIES_DIR, "cookies.txt"),
+        ])
+    for path in candidates:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+    return None
+
 
 def _base_opts(platform: str = None) -> dict:
     opts = {
@@ -334,11 +261,8 @@ def _base_opts(platform: str = None) -> dict:
         "socket-timeout": 30,
         "retries": 3,
     }
-    # TikTok: do NOT attach cookies — yt-dlp's challenge solver sets its own
-    # short-lived cookies, and user cookies break them (causes
-    # "Unable to extract universal data for rehydration").
-    cookie_file = os.path.join(config.COOKIES_DIR, f"{platform}.txt")
-    if platform != "tiktok" and os.path.exists(cookie_file):
+    cookie_file = _find_cookie_file(platform)
+    if cookie_file:
         opts["cookies"] = cookie_file
     return opts
 
@@ -360,10 +284,9 @@ async def get_info(url: str, platform: str = None, _retry: bool = True) -> Optio
     """Get video info without downloading."""
     cmd = [YTDLP, "--dump-json", "--no-download", "--no-playlist"]
 
-    # Only pass CLI-compatible options.
-    # Skip cookies for TikTok — they break yt-dlp's challenge solver.
-    cookie_file = os.path.join(config.COOKIES_DIR, f"{platform}.txt")
-    if platform != "tiktok" and os.path.exists(cookie_file):
+    # Attach cookies with platform-aware fallback (Threads → Instagram).
+    cookie_file = _find_cookie_file(platform)
+    if cookie_file:
         cmd.extend(["--cookies", cookie_file])
 
     cmd.append(url)
@@ -438,6 +361,7 @@ async def download(url: str, platform: str = None, audio_only: bool = False, qua
         "--print", "after_move:%(uploader_id)s",
         "--print", "after_move:%(uploader)s",
         "--print", "after_move:%(tags)j",
+        "--print", "after_move:%(description)j",
         "--no-simulate",
     ])
     cmd.append(url)
@@ -500,6 +424,7 @@ async def download(url: str, platform: str = None, audio_only: bool = False, qua
                                 file_size=file_size,
                                 thumbnail=info.get("thumbnail") if info else None,
                                 platform=platform,
+                                description=info.get("description") if info else None,
                             )
                     err = stderr.decode("utf-8", "replace").strip().split("\n")[-1]
         return DownloadResult(success=False, error=err[:200])
@@ -507,15 +432,18 @@ async def download(url: str, platform: str = None, audio_only: bool = False, qua
     # Capture full stderr so failures show the real yt-dlp reason instead of
     # a generic "File not found".
     full_stderr = stderr.decode("utf-8", "replace").strip()
-    out_lines = [ln for ln in stdout.decode("utf-8", "replace").strip().split("\n") if ln.strip()]
+    # Keep ALL lines including blanks so positional indices match --print order.
+    # Only the filepath resolver and metadata parser rely on specific positions.
+    _raw_lines = stdout.decode("utf-8", "replace").strip().split("\n")
+    out_lines = _raw_lines  # preserve blank lines for correct index alignment
 
     # Resolve the downloaded file. The first non-empty stdout line should be the
     # filepath from --print after_move:filepath, but for some extractors (TikTok
     # single-file, no post-processing) after_move can print an empty/old path.
     # Fall back to globbing the download dir for the video id from the URL.
     def _resolve_filepath():
-        if out_lines and os.path.exists(out_lines[0]):
-            return out_lines[0]
+        if out_lines and out_lines[0].strip() and os.path.exists(out_lines[0].strip()):
+            return out_lines[0].strip()
         # Fallback: find by video id in the output dir
         m = re.search(r"/video/(\d+)|/(\d{8,})", url) or re.search(r"(\d{8,})", url)
         vid = next((g for g in (m.groups() if m else []) if g), None)
@@ -542,13 +470,15 @@ async def download(url: str, platform: str = None, audio_only: bool = False, qua
 
     # Parse metadata printed in the SAME yt-dlp pass.
     # out_lines layout (in --print order):
-    #   [filepath, title, duration, thumbnail, webpage_url, uploader_id, uploader, tags_json]
+    #   [0:filepath, 1:title, 2:duration, 3:thumbnail, 4:webpage_url,
+    #    5:uploader_id, 6:uploader, 7:tags_json, 8:description_json]
     title = "Download"
     duration = None
     thumbnail = None
     source_url = None
     uploader_id = None
     tags = None
+    description = None
 
     def _na(v):
         v = (v or "").strip()
@@ -571,6 +501,15 @@ async def download(url: str, platform: str = None, audio_only: bool = False, qua
                 tags = [str(t) for t in parsed if t]
         except (json.JSONDecodeError, IndexError):
             tags = None
+        # description printed as JSON string via %(description)j — newlines are
+        # escaped, so it always occupies a single output line.
+        if len(out_lines) >= 9:
+            try:
+                desc_raw = json.loads(out_lines[8]) if out_lines[8] else None
+                if isinstance(desc_raw, str) and desc_raw.strip() and desc_raw.strip() != "NA":
+                    description = desc_raw.strip()
+            except (json.JSONDecodeError, IndexError):
+                description = None
     elif len(out_lines) >= 4:
         # Older/partial print (fallback): [filepath, title, duration, thumbnail]
         title = _sanitize_title(out_lines[-3] or "Download")
@@ -586,9 +525,27 @@ async def download(url: str, platform: str = None, audio_only: bool = False, qua
         source_url = url
     source_url = _clean_source_url(source_url)
     if not uploader_id:
-        m = re.search(r"(?:tiktok\.com|instagram\.com)/@?([\w.]+)", url)
+        m = re.search(r"(?:tiktok\.com|instagram\.com|threads\.net)/@?([\w.]+)", url)
         if m:
             uploader_id = m.group(1)
+
+    # If description or audio info is missing, try to fetch via get_info (dump-json).
+    audio_url = None
+    audio_title = None
+    audio_artist = None
+    if description is None or platform == "threads":
+        try:
+            _info = await get_info(url, platform, _retry=False)
+            if _info:
+                if description is None and _info.get("description"):
+                    description = str(_info["description"]).strip()
+                # Audio track info (Threads posts with background music)
+                if _info.get("audio_url"):
+                    audio_url = str(_info["audio_url"])
+                    audio_title = str(_info["audio_title"]) if _info.get("audio_title") else None
+                    audio_artist = str(_info["audio_artist"]) if _info.get("audio_artist") else None
+        except Exception:
+            pass
 
     return DownloadResult(
         success=True,
@@ -601,6 +558,10 @@ async def download(url: str, platform: str = None, audio_only: bool = False, qua
         source_url=source_url,
         uploader_id=uploader_id,
         tags=tags,
+        description=description,
+        audio_url=audio_url,
+        audio_title=audio_title,
+        audio_artist=audio_artist,
     )
 
 def cleanup_file(path: str):
@@ -622,6 +583,298 @@ def cleanup_old_files(max_age_hours: int = 1):
                 os.remove(f)
             except OSError:
                 pass
+
+
+# ─── Gallery / carousel support ──────────────────────────────────
+
+
+@dataclass
+class GalleryResult:
+    """Result of downloading a multi-photo carousel / slideshow post."""
+    success: bool
+    photos: list[str] = None       # local file paths to images
+    videos: list[str] = None       # local file paths to videos
+    audio_path: str = None         # optional background audio
+    title: str = "Gallery"
+    source_url: str = None
+    uploader_id: str = None
+    tags: list[str] = None
+    description: str = None
+    error: str = None
+    platform: str = None
+    thumbnail: str = None
+    audio_url: str = None
+    audio_title: str = None
+    audio_artist: str = None
+
+
+def is_photo_post(info: dict) -> bool:
+    """Detect if yt-dlp info dict represents a photo carousel / slideshow."""
+    if not info:
+        return False
+
+    IMAGE_EXTS = {"jpg", "jpeg", "png", "webp", "gif", "bmp"}
+
+    def _looks_like_image(entry):
+        if not entry:
+            return False
+        ext = (entry.get("ext") or "").lower()
+        if ext in IMAGE_EXTS:
+            return True
+        # No formats key + direct URL → likely an image
+        url = entry.get("url") or ""
+        if url and not entry.get("formats"):
+            # Check URL extension
+            path = url.split("?")[0].split("#")[0]
+            if any(path.lower().endswith(f".{e}") for e in IMAGE_EXTS):
+                return True
+        # Some extractors mark images with vcodec=none and acodec=none
+        if entry.get("vcodec") == "none" and entry.get("acodec") == "none":
+            return True
+        return False
+
+    # Playlist/carousel with entries
+    entries = info.get("entries")
+    if entries:
+        return any(_looks_like_image(e) for e in entries)
+    # Playlist type even without explicit entries
+    if info.get("_type") == "playlist":
+        return True
+    # Single image post
+    return _looks_like_image(info)
+
+
+async def download_gallery(url: str, platform: str = None) -> Optional[GalleryResult]:
+    """Download all items from a carousel/gallery post.
+
+    Uses yt-dlp WITHOUT --no-playlist so every carousel item is fetched.
+    Returns a GalleryResult with lists of photo and video paths.
+    """
+    os.makedirs(config.DOWNLOAD_DIR, exist_ok=True)
+
+    # Get metadata (with playlist to see the full structure).
+    info = await _get_info_with_playlist(url, platform)
+    description = None
+    source_url = url
+    uploader_id = None
+    tags = None
+    title = "Gallery"
+    audio_url = None
+    audio_title = None
+    audio_artist = None
+    if info:
+        description = info.get("description")
+        title = info.get("title") or "Gallery"
+        uploader_id = info.get("uploader_id") or info.get("uploader")
+        source_url = info.get("webpage_url") or url
+        raw_tags = info.get("tags")
+        if isinstance(raw_tags, list):
+            tags = [str(t) for t in raw_tags if t]
+        # Audio track (Threads posts with background music)
+        if info.get("audio_url"):
+            audio_url = str(info["audio_url"])
+            audio_title = str(info["audio_title"]) if info.get("audio_title") else None
+            audio_artist = str(info["audio_artist"]) if info.get("audio_artist") else None
+
+    # Download ALL carousel items in a single yt-dlp pass (no --no-playlist).
+    opts = _base_opts(platform)
+    opts.pop("no-playlist", None)  # allow playlist/carousel
+    gallery_template = os.path.join(
+        config.DOWNLOAD_DIR,
+        f"gal_{os.getpid()}_%(playlist_index|0)s_%(id)s.%(ext)s",
+    )
+    opts["output"] = gallery_template
+
+    cmd = [YTDLP]
+    for k, v in opts.items():
+        flag = f"--{k.replace('_', '-')}"
+        if isinstance(v, bool):
+            if v:
+                cmd.append(flag)
+        elif isinstance(v, (str, int, float)):
+            cmd.extend([flag, str(v)])
+
+    # Print filepath + ext for each downloaded item (2 lines per item).
+    cmd.extend([
+        "--print", "after_move:filepath",
+        "--print", "after_move:%(ext)s",
+        "--no-simulate",
+    ])
+    cmd.append(url)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=config.YT_DLP_TIMEOUT,
+        )
+    except Exception as e:
+        return GalleryResult(success=False, error=str(e)[:200])
+
+    if proc.returncode != 0:
+        err = stderr.decode("utf-8", "replace").strip().split("\n")[-1] if stderr else "yt-dlp error"
+        return GalleryResult(success=False, error=err[:200])
+
+    raw_lines = stdout.decode("utf-8", "replace").strip().split("\n")
+
+    # Parse output in pairs: (filepath, ext)
+    photos = []
+    videos = []
+    IMAGE_EXTS = {"jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff"}
+
+    i = 0
+    while i < len(raw_lines) - 1:
+        fpath = raw_lines[i].strip()
+        ext = raw_lines[i + 1].strip().lower()
+        i += 2
+
+        if not fpath or not os.path.exists(fpath):
+            continue
+        if os.path.getsize(fpath) == 0:
+            os.remove(fpath)
+            continue
+
+        if ext in IMAGE_EXTS:
+            photos.append(fpath)
+        else:
+            videos.append(fpath)
+
+    # Fallback: if no paired output, look for any gallery files created.
+    if not photos and not videos:
+        prefix = f"gal_{os.getpid()}_"
+        for f in sorted(glob.glob(os.path.join(config.DOWNLOAD_DIR, prefix + "*"))):
+            if not os.path.getsize(f):
+                continue
+            fext = os.path.splitext(f)[1].lstrip(".").lower()
+            if fext in IMAGE_EXTS:
+                photos.append(f)
+            else:
+                videos.append(f)
+
+    if not photos and not videos:
+        return GalleryResult(success=False, error="No media downloaded from gallery")
+
+    # If description is still missing, try a separate get_info (dump-json) call
+    # to pick it up. Carousel children often lack the parent's text field.
+    if not description:
+        try:
+            _info = await get_info(url, platform, _retry=False)
+            if _info and _info.get("description"):
+                description = str(_info["description"]).strip()
+            elif _info and _info.get("title"):
+                _t = str(_info["title"]).strip()
+                if _t and not _t.startswith("Threads post ") and len(_t) > 5:
+                    description = _t
+        except Exception:
+            pass
+
+    return GalleryResult(
+        success=True,
+        photos=photos,
+        videos=videos,
+        title=title,
+        source_url=source_url,
+        uploader_id=uploader_id,
+        tags=tags,
+        description=description,
+        platform=platform,
+        audio_url=audio_url,
+        audio_title=audio_title,
+        audio_artist=audio_artist,
+    )
+
+
+async def _get_info_with_playlist(url: str, platform: str = None) -> Optional[dict]:
+    """Like get_info but WITHOUT --no-playlist (for carousel posts)."""
+    cmd = [YTDLP, "--dump-json", "--no-download"]
+
+    cookie_file = _find_cookie_file(platform)
+    if cookie_file:
+        cmd.extend(["--cookies", cookie_file])
+
+    # Plugin dirs
+    plugin_dir = os.path.join(_PROJECT_ROOT, "plugins")
+    if os.path.isdir(plugin_dir):
+        cmd.extend(["--plugin-dirs", plugin_dir])
+
+    cmd.append(url)
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+    if proc.returncode != 0:
+        return None
+    raw = stdout.decode("utf-8", "replace").strip()
+    # Multiple JSON objects = playlist entries — wrap them
+    lines = raw.split("\n")
+    entries = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            entries.append(json.loads(ln))
+        except json.JSONDecodeError:
+            pass
+    if not entries:
+        return None
+    if len(entries) == 1:
+        return entries[0]
+    # Multiple entries → synthesize a playlist dict
+    first = entries[0]
+    # Try to find a description from any entry (carousel children may not carry
+    # the parent text, but the first or title-bearing entry sometimes does).
+    desc = None
+    for e in entries:
+        d = e.get("description")
+        if d and isinstance(d, str) and d.strip():
+            desc = d.strip()
+            break
+    # Fallback: some plugins put the text as the title when description is empty.
+    if not desc:
+        for e in entries:
+            t = e.get("title") or ""
+            if t and not t.startswith("Threads post ") and len(t) > 5:
+                desc = t.strip()
+                break
+    return {
+        "_type": "playlist",
+        "title": first.get("title", "Gallery"),
+        "description": desc,
+        "uploader_id": first.get("uploader_id"),
+        "uploader": first.get("uploader"),
+        "webpage_url": first.get("webpage_url"),
+        "tags": first.get("tags"),
+        "entries": entries,
+    }
+
+
+async def build_slideshow(*args, **kwargs):
+    """Placeholder — slideshow rendering not yet implemented."""
+    return None
+
+
+def cleanup_gallery(gallery: GalleryResult):
+    """Clean up downloaded gallery files."""
+    if gallery is None:
+        return
+    for f in (gallery.photos or []) + (gallery.videos or []):
+        try:
+            if f and os.path.exists(f):
+                os.remove(f)
+        except OSError:
+            pass
+    if gallery.audio_path:
+        try:
+            os.remove(gallery.audio_path)
+        except OSError:
+            pass
 
 
 def split_video(file_path: str, max_size_mb: int = 48) -> list[str]:

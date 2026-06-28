@@ -410,28 +410,37 @@ VALID_GALLERY_MODES = ("photos", "video")
 VALID_AUDIO_MODES = ("off", "separate")
 
 
+_DESC_PLATFORMS = ("instagram", "tiktok", "threads", "youtube")
+
+
 async def get_user_settings(user_id: int) -> dict:
     """Return this user's personal preferences with safe defaults."""
     db = await get_db()
     try:
         rows = await db.execute_fetchall(
             "SELECT language, show_tags, show_source_channel, download_mode, "
-            "tiktok_watermark, description_mode, caption_mode, gallery_mode, audio_mode "
+            "tiktok_watermark, description_mode, caption_mode, gallery_mode, audio_mode, "
+            "desc_mode_instagram, desc_mode_tiktok, desc_mode_threads, desc_mode_youtube "
             "FROM users WHERE user_id = ?",
             (user_id,),
         )
+        defaults = {
+            "language": "en",
+            "show_tags": False,
+            "show_source_channel": False,
+            "download_mode": "ask",
+            "tiktok_watermark": False,
+            "description_mode": "with",
+            "caption_mode": "src_via",
+            "gallery_mode": "photos",
+            "audio_mode": "off",
+            "desc_mode_instagram": "default",
+            "desc_mode_tiktok": "default",
+            "desc_mode_threads": "default",
+            "desc_mode_youtube": "default",
+        }
         if not rows:
-            return {
-                "language": "en",
-                "show_tags": False,
-                "show_source_channel": False,
-                "download_mode": "ask",
-                "tiktok_watermark": False,
-                "description_mode": "off",
-                "caption_mode": "src_via",
-                "gallery_mode": "photos",
-                "audio_mode": "off",
-            }
+            return defaults
         r = dict(rows[0])
         mode = r.get("download_mode") or "ask"
         if mode not in VALID_DOWNLOAD_MODES:
@@ -448,7 +457,7 @@ async def get_user_settings(user_id: int) -> dict:
         aud_mode = r.get("audio_mode") or "off"
         if aud_mode not in VALID_AUDIO_MODES:
             aud_mode = "off"
-        return {
+        result = {
             "language": r.get("language") or "en",
             "show_tags": bool(r.get("show_tags")),
             "show_source_channel": bool(r.get("show_source_channel")),
@@ -459,6 +468,14 @@ async def get_user_settings(user_id: int) -> dict:
             "gallery_mode": gal_mode,
             "audio_mode": aud_mode,
         }
+        # Per-platform description modes ("default" = inherit global setting)
+        for plat in _DESC_PLATFORMS:
+            col = f"desc_mode_{plat}"
+            val = r.get(col) or "default"
+            if val != "default" and val not in VALID_DESCRIPTION_MODES:
+                val = "default"
+            result[col] = val
+        return result
     finally:
         await db.close()
 
@@ -516,6 +533,23 @@ async def set_user_description_mode(user_id: int, mode: str):
     try:
         await db.execute(
             "UPDATE users SET description_mode = ? WHERE user_id = ?", (mode, user_id)
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def set_user_platform_desc_mode(user_id: int, platform: str, mode: str):
+    """Set per-platform description mode (instagram / tiktok / threads / youtube)."""
+    if platform not in _DESC_PLATFORMS:
+        return
+    if mode != "default" and mode not in VALID_DESCRIPTION_MODES:
+        mode = "default"
+    col = f"desc_mode_{platform}"
+    db = await get_db()
+    try:
+        await db.execute(
+            f"UPDATE users SET {col} = ? WHERE user_id = ?", (mode, user_id)
         )
         await db.commit()
     finally:

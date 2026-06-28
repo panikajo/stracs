@@ -20,6 +20,7 @@ from services.downloader import download, get_info, cleanup_file, DownloadResult
 try:
     from services.downloader import (
         download_gallery, build_slideshow, cleanup_gallery, is_photo_post, GalleryResult,
+        _get_info_with_playlist,
     )
 except ImportError:
     class GalleryResult:  # fallback only for type annotations
@@ -36,6 +37,49 @@ except ImportError:
 
     def cleanup_gallery(gallery):
         pass
+
+    async def _get_info_with_playlist(*args, **kwargs):
+        return None
+
+
+async def _download_audio_url(url: str, platform: str = None) -> str | None:
+    """Download an audio file from a direct URL (e.g. Threads music track).
+
+    Returns the local file path or None on failure.
+    """
+    import aiohttp
+    import tempfile
+    try:
+        headers = {"Referer": "https://www.threads.net/"}
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    return None
+                # Determine extension from content-type or URL
+                ct = resp.headers.get("Content-Type", "")
+                if "mpeg" in ct or url.endswith(".mp3"):
+                    ext = ".mp3"
+                elif "mp4" in ct or "m4a" in ct:
+                    ext = ".m4a"
+                elif "ogg" in ct:
+                    ext = ".ogg"
+                else:
+                    ext = ".mp3"
+                fd, path = tempfile.mkstemp(suffix=ext, dir=config.DOWNLOAD_DIR)
+                with os.fdopen(fd, "wb") as f:
+                    while True:
+                        chunk = await resp.content.read(1024 * 64)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                if os.path.getsize(path) < 1000:
+                    # Too small to be real audio
+                    os.remove(path)
+                    return None
+                return path
+    except Exception:
+        return None
 
 
 async def _download_compat(url: str, platform: str, *, audio_only: bool = False, quality: str = "480", watermark: bool = False):
@@ -822,12 +866,25 @@ async def process_quality_download(bot: Bot, user_id: int, quality: str, short_i
         finally:
             cleanup_gallery(gal)
 
-    # Instagram carousels need every item, so detect a photo post up front
-    # (get_info is reliable for IG with cookies). TikTok detection is handled by
-    # the post-failure fallback below (slideshow video downloads fail cleanly).
+    # Instagram / Threads carousels need every item. For Instagram we use the
+    # regular get_info (with --no-playlist) and check is_photo_post. For Threads
+    # we must use _get_info_with_playlist (without --no-playlist) because
+    # get_info flattens the carousel to one item and we lose detection.
     if not audio_only and platform == "instagram":
         info = await get_info(url, platform)
         if is_photo_post(info):
+            gal = await download_gallery(url, platform)
+            if gal and gal.success:
+                await _run_gallery(gal)
+                return
+            cleanup_gallery(gal)
+
+    if not audio_only and platform == "threads":
+        # Fetch info WITHOUT --no-playlist to see all carousel entries.
+        info = await _get_info_with_playlist(url, platform)
+        entries = info.get("entries") if info else None
+        is_carousel = entries and len(entries) > 1
+        if is_carousel or is_photo_post(info):
             gal = await download_gallery(url, platform)
             if gal and gal.success:
                 await _run_gallery(gal)
@@ -872,7 +929,7 @@ async def process_quality_download(bot: Bot, user_id: int, quality: str, short_i
         if not result.success:
             # Fallback: a photo carousel / TikTok slideshow has no playable video,
             # so the normal download fails — try a gallery download instead.
-            if not audio_only and platform in ("tiktok", "instagram"):
+            if not audio_only and platform in ("tiktok", "instagram", "threads"):
                 gal = await download_gallery(url, platform)
                 if gal and gal.success:
                     await _run_gallery(gal)
@@ -909,7 +966,7 @@ async def process_quality_download(bot: Bot, user_id: int, quality: str, short_i
             return
 
     # Effective caption flags + per-group "delete user's link" behaviour.
-    cfg = await _resolve_caption_config(chat_id, user_id, user_prefs)
+    cfg = await _resolve_caption_config(chat_id, user_id, user_prefs, platform=platform)
     show_tags = cfg["show_tags"]
     show_source_channel = cfg["show_source_channel"]
     delete_user_url = cfg["delete_user_url"]
@@ -1005,6 +1062,23 @@ async def process_quality_download(bot: Bot, user_id: int, quality: str, short_i
                 reply_to_message_id=reply_to_message_id,
             )
 
+        # ── Threads background audio (music track from the post) ──
+        if getattr(result, "audio_url", None):
+            try:
+                audio_file = await _download_audio_url(result.audio_url, platform)
+                if audio_file and os.path.exists(audio_file):
+                    _atitle = getattr(result, "audio_title", None) or "Audio"
+                    _aartist = getattr(result, "audio_artist", None)
+                    await bot.send_audio(
+                        chat_id=chat_id,
+                        audio=FSInputFile(audio_file),
+                        title=_atitle[:64],
+                        performer=_aartist[:64] if _aartist else None,
+                    )
+                    cleanup_file(audio_file)
+            except Exception:
+                pass
+
         await _maybe_send_description()
         await record_download(user_id, url, platform, result.title, result.file_size, chat_id=chat_id)
         await _maybe_delete_user_link()
@@ -1015,12 +1089,13 @@ async def process_quality_download(bot: Bot, user_id: int, quality: str, short_i
         cleanup_file(result.file_path)
 
 
-async def _resolve_caption_config(chat_id: int, user_id: int, user_prefs=None) -> dict:
+async def _resolve_caption_config(chat_id: int, user_id: int, user_prefs=None, platform: str = None) -> dict:
     """Resolve effective caption/description flags for a chat.
 
     • Groups/channels (chat_id < 0): per-group settings configured in
       "My groups". Admin global flags act as a force-on-for-everyone OR.
     • Private chats (chat_id > 0): the user's personal ⚙️ Settings.
+      Per-platform description mode is used when available.
     """
     admin_tags = await get_setting("feature_show_tags", "0") == "1"
     admin_channel = await get_setting("feature_show_source_channel", "0") == "1"
@@ -1029,7 +1104,7 @@ async def _resolve_caption_config(chat_id: int, user_id: int, user_prefs=None) -
         "show_source_channel": admin_channel,
         "delete_user_url": False,
         "caption_mode": "src_via",   # default credit line (groups keep this)
-        "desc_mode": "off",          # default: no description (groups keep this)
+        "desc_mode": "with",         # default: show description with caption
     }
     if chat_id < 0:
         g = await get_group_settings(chat_id)
@@ -1045,7 +1120,13 @@ async def _resolve_caption_config(chat_id: int, user_id: int, user_prefs=None) -
         cfg["show_tags"] = admin_tags or user_prefs["show_tags"]
         cfg["show_source_channel"] = admin_channel or user_prefs["show_source_channel"]
         cfg["caption_mode"] = user_prefs.get("caption_mode", "src_via")
-        cfg["desc_mode"] = user_prefs.get("description_mode", "off")
+        # Per-platform description mode: "default" → inherit global setting
+        global_desc = user_prefs.get("description_mode", "off")
+        if platform:
+            plat_val = user_prefs.get(f"desc_mode_{platform}", "default")
+            cfg["desc_mode"] = global_desc if plat_val == "default" else plat_val
+        else:
+            cfg["desc_mode"] = global_desc
     return cfg
 
 
@@ -1061,7 +1142,7 @@ async def process_gallery(bot: Bot, user_id: int, url: str, platform: str,
     audio_mode='separate' → also send the post's audio as a standalone .mp3.
     """
     lang = await _effective_chat_language(chat_id, user_id)
-    cfg = await _resolve_caption_config(chat_id, user_id)
+    cfg = await _resolve_caption_config(chat_id, user_id, platform=platform)
 
     caption = build_caption(
         gallery, via_user=via_user, via_chat=via_chat,
@@ -1069,8 +1150,11 @@ async def process_gallery(bot: Bot, user_id: int, url: str, platform: str,
         caption_mode=cfg["caption_mode"], desc_mode=cfg["desc_mode"],
     )
 
-    images = [p for p in gallery.image_paths if os.path.exists(p) and os.path.getsize(p) <= config.MAX_FILE_SIZE]
-    videos = [p for p in gallery.video_paths if os.path.exists(p) and os.path.getsize(p) <= config.MAX_FILE_SIZE]
+    # Support both .image_paths/.video_paths and .photos/.videos field names.
+    _img_list = getattr(gallery, "image_paths", None) or getattr(gallery, "photos", None) or []
+    _vid_list = getattr(gallery, "video_paths", None) or getattr(gallery, "videos", None) or []
+    images = [p for p in _img_list if os.path.exists(p) and os.path.getsize(p) <= config.MAX_FILE_SIZE]
+    videos = [p for p in _vid_list if os.path.exists(p) and os.path.getsize(p) <= config.MAX_FILE_SIZE]
     sent_any = False
     slideshow_path = None
 
@@ -1160,6 +1244,24 @@ async def process_gallery(bot: Bot, user_id: int, url: str, platform: str,
                 sent_any = True
             except Exception:
                 pass
+
+    # ── Threads background audio (music track from the post) ──
+    if gallery.audio_url:
+        try:
+            audio_file = await _download_audio_url(gallery.audio_url, platform)
+            if audio_file and os.path.exists(audio_file):
+                _atitle = gallery.audio_title or "Audio"
+                _aartist = gallery.audio_artist or None
+                await bot.send_audio(
+                    chat_id=chat_id,
+                    audio=FSInputFile(audio_file),
+                    title=_atitle[:64],
+                    performer=_aartist[:64] if _aartist else None,
+                )
+                sent_any = True
+                cleanup_file(audio_file)
+        except Exception:
+            pass
 
     # ── Separate description message (desc_mode='separate') ──
     if cfg["desc_mode"] == "separate":

@@ -168,10 +168,14 @@ USER_MIGRATIONS = {
     "show_source_channel": "INTEGER DEFAULT 0",
     "download_mode": "TEXT DEFAULT 'ask'",
     "tiktok_watermark": "INTEGER DEFAULT 0",
-    "description_mode": "TEXT DEFAULT 'off'",
+    "description_mode": "TEXT DEFAULT 'with'",
     "caption_mode": "TEXT DEFAULT 'src_via'",
     "gallery_mode": "TEXT DEFAULT 'photos'",
     "audio_mode": "TEXT DEFAULT 'off'",
+    "desc_mode_instagram": "TEXT DEFAULT 'default'",
+    "desc_mode_tiktok": "TEXT DEFAULT 'default'",
+    "desc_mode_threads": "TEXT DEFAULT 'default'",
+    "desc_mode_youtube": "TEXT DEFAULT 'default'",
 }
 
 DOWNLOAD_MIGRATIONS = {
@@ -190,10 +194,14 @@ MYSQL_USER_MIGRATIONS = {
     "show_source_channel": "TINYINT DEFAULT 0",
     "download_mode": "VARCHAR(32) DEFAULT 'ask'",
     "tiktok_watermark": "TINYINT DEFAULT 0",
-    "description_mode": "VARCHAR(32) DEFAULT 'off'",
+    "description_mode": "VARCHAR(32) DEFAULT 'with'",
     "caption_mode": "VARCHAR(32) DEFAULT 'src_via'",
     "gallery_mode": "VARCHAR(32) DEFAULT 'photos'",
     "audio_mode": "VARCHAR(32) DEFAULT 'off'",
+    "desc_mode_instagram": "VARCHAR(32) DEFAULT 'default'",
+    "desc_mode_tiktok": "VARCHAR(32) DEFAULT 'default'",
+    "desc_mode_threads": "VARCHAR(32) DEFAULT 'default'",
+    "desc_mode_youtube": "VARCHAR(32) DEFAULT 'default'",
 }
 MYSQL_DOWNLOAD_MIGRATIONS = {"chat_id": "BIGINT NULL"}
 MYSQL_GROUP_MIGRATIONS = {
@@ -275,6 +283,12 @@ async def _init_sqlite_db(db_path: str):
         for name, ddl in GROUP_MIGRATIONS.items():
             if name not in group_cols:
                 await db.execute(f"ALTER TABLE group_chats ADD COLUMN {name} {ddl}")
+
+        # One-time: upgrade description_mode from legacy "off" default to "with"
+        # so existing users get post descriptions by default.
+        await db.execute(
+            "UPDATE users SET description_mode = 'with' WHERE description_mode = 'off'"
+        )
 
         for k, v in DEFAULT_SETTINGS.items():
             await db.execute(
