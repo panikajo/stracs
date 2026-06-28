@@ -1,6 +1,8 @@
 import asyncio
 import os
+import re
 import html
+import inspect
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, FSInputFile
 from aiogram.filters import Command
@@ -10,10 +12,51 @@ from database.db import (
     get_group_settings, ensure_group_chat,
 )
 from services.platform import detect_platform, get_platform_info
-from services.downloader import (
-    download, get_info, cleanup_file, DownloadResult,
-    download_gallery, build_slideshow, cleanup_gallery, is_photo_post, GalleryResult,
-)
+from services.downloader import download, get_info, cleanup_file, DownloadResult
+
+# Some deployed versions of services/downloader.py do not yet contain gallery /
+# slideshow helpers. Keep handlers/download.py backward-compatible so the bot can
+# start even before those optional helpers are added.
+try:
+    from services.downloader import (
+        download_gallery, build_slideshow, cleanup_gallery, is_photo_post, GalleryResult,
+    )
+except ImportError:
+    class GalleryResult:  # fallback only for type annotations
+        pass
+
+    def is_photo_post(info):
+        return False
+
+    async def download_gallery(*args, **kwargs):
+        return None
+
+    async def build_slideshow(*args, **kwargs):
+        return None
+
+    def cleanup_gallery(gallery):
+        pass
+
+
+async def _download_compat(url: str, platform: str, *, audio_only: bool = False, quality: str = "480", watermark: bool = False):
+    """Call services.downloader.download with only supported keyword args.
+
+    Some deployed downloader.py versions do not support the newer `watermark`
+    option. Introspect the real function so handlers/download.py remains
+    backward-compatible instead of crashing with unexpected keyword argument.
+    """
+    kwargs = {"audio_only": audio_only, "quality": quality}
+    try:
+        sig = inspect.signature(download)
+        params = sig.parameters
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        if accepts_kwargs or "watermark" in params:
+            kwargs["watermark"] = watermark
+    except Exception:
+        # If signature inspection fails, use the conservative old API.
+        pass
+    return await download(url, platform, **kwargs)
+
 from aiogram.types import InputMediaPhoto, InputMediaVideo
 from services.limiter import is_downloading, set_active, clear_active, cancel_download
 from keyboards.inline import quality_keyboard, cancel_keyboard
@@ -30,28 +73,152 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "tikloadtokbot")
 VIA_START_PARAM = os.getenv("VIA_START_PARAM", "c")
 
 
+
+def _normalize_threads_url(url: str) -> str:
+    """Normalize Slack/Threads URLs before platform detection and yt-dlp.
+
+    yt-dlp may not recognize threads.com or Slack-style <url> wrappers.
+    Convert to the canonical threads.net post URL and drop tracking params.
+    """
+    if not url:
+        return url
+    u = str(url).strip().strip("<>").strip()
+    # Slack sometimes stores <url|label>; keep only URL part.
+    if u.startswith("http") and "|" in u:
+        u = u.split("|", 1)[0].strip("<>")
+    m = re.search(r"https?://(?:www\.)?threads\.(?:com|net)/(@[^/]+)/(post|media)/([^/?#>]+)", u, re.I)
+    if m:
+        user, kind, post_id = m.groups()
+        return f"https://www.threads.net/{user}/{kind}/{post_id}"
+    return u
+
+
 def _platform_label(platform: str) -> str:
     return {
         "youtube": "YouTube",
         "instagram": "Instagram",
         "tiktok": "TikTok",
+        "threads": "Threads",
     }.get(platform, "Джерело")
+
+
+def _clean_author_login(value) -> str:
+    """Return a safe @username candidate, or empty string if it looks like an ID.
+
+    TikTok / yt-dlp can return a numeric internal author id in `uploader_id`
+    (example: 7332883848974812165). That must not be displayed as @nickname.
+    Prefer human-readable fields and reject pure numeric IDs / URLs / names with
+    spaces.
+    """
+    if value is None:
+        return ""
+    value = str(value).strip().lstrip("@")
+    if not value:
+        return ""
+    if value.isdigit():
+        return ""
+    if value.startswith(("http://", "https://")):
+        return ""
+    if len(value) > 30:
+        return ""
+    # TikTok/Instagram usernames are normally latin letters, digits, dot,
+    # underscore. Reject display names with spaces/emojis.
+    if not re.fullmatch(r"[A-Za-z0-9._]{2,30}", value):
+        return ""
+    return value
+
+
+def _author_login(result) -> str:
+    """Best-effort source username for captions.
+
+    Order matters: `uploader_id` is often an internal numeric TikTok id, so it is
+    checked only after friendlier fields and still validated.
+    """
+    for field in ("uploader", "channel", "creator", "artist", "uploader_id", "channel_id"):
+        login = _clean_author_login(getattr(result, field, None))
+        if login:
+            return login
+
+    # Last chance: extract username from the source URL itself.
+    source_url = getattr(result, "source_url", "") or ""
+    platform = getattr(result, "platform", "")
+    if platform == "tiktok":
+        # TikTok author URLs are /@username/..., do not treat /video/... as a username.
+        m = re.search(r"tiktok\.com/@([A-Za-z0-9._]{2,30})(?:/|$)", source_url)
+    elif platform == "instagram":
+        # Instagram post URLs like /p/... or /reel/... are not usernames.
+        m = re.search(r"instagram\.com/(?!p/|reel/|tv/|stories/|explore/)([A-Za-z0-9._]{2,30})(?:/|$)", source_url)
+    elif platform == "threads":
+        m = re.search(r"threads\.(?:net|com)/@([A-Za-z0-9._]{2,30})(?:/|$)", source_url)
+    else:
+        m = None
+    if m:
+        return _clean_author_login(m.group(1))
+    return ""
 
 
 def _author_url(result) -> str:
     """Best-effort link to the content author's profile."""
-    login = (result.uploader_id or "").lstrip("@")
-    platform = result.platform
+    login = _author_login(result)
+    platform = getattr(result, "platform", "")
     if login:
         if platform == "tiktok":
             return f"https://www.tiktok.com/@{login}"
         if platform == "instagram":
             return f"https://instagram.com/{login}"
+        if platform == "threads":
+            return f"https://www.threads.net/@{login}"
     # Fallback: the post link itself.
-    return result.source_url or ""
+    return getattr(result, "source_url", "") or ""
 
 
-def build_caption(result, via_user=None, show_tags=False, show_source_channel=False,
+def _chat_url(chat) -> str:
+    """Public Telegram URL for a sender_chat/channel, if Telegram exposes one."""
+    if chat is None:
+        return ""
+    username = getattr(chat, "username", None)
+    if username:
+        return f"https://t.me/{username}"
+    return ""
+
+
+def _chat_title(chat) -> str:
+    if chat is None:
+        return ""
+    return getattr(chat, "title", None) or getattr(chat, "full_name", None) or getattr(chat, "username", None) or "Via"
+
+
+def _message_via_chat(message):
+    """If a message was sent as a group/channel, use that chat as Via."""
+    return getattr(message, "sender_chat", None) if message is not None else None
+
+
+def _message_via_user(message):
+    """Use the real user unless Telegram only gives GroupAnonymousBot."""
+    if message is None:
+        return None
+    user = getattr(message, "from_user", None)
+    if not user:
+        return None
+    if getattr(user, "username", None) == "GroupAnonymousBot":
+        return None
+    return user
+
+
+def _clean_source_description(text: str) -> str:
+    """Remove extractor junk like a bare numeric TikTok author id."""
+    if not text:
+        return ""
+    cleaned = []
+    for line in str(text).splitlines():
+        stripped = line.strip()
+        if re.fullmatch(r"@?\d{8,}", stripped):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned).strip()
+
+
+def build_caption(result, via_user=None, via_chat=None, show_tags=False, show_source_channel=False,
                   caption_mode="src_via", desc_mode="off") -> str:
     """Build the Telegram HTML caption for a finished download.
 
@@ -73,26 +240,36 @@ def build_caption(result, via_user=None, show_tags=False, show_source_channel=Fa
     """
     source_url = result.source_url or ""
 
-    # "Via" points to the user who sent the link.
+    # "Via" points to the chat/channel that sent the link when Telegram provides
+    # sender_chat (anonymous admin / post as channel). Otherwise it points to the
+    # real user. Never use @GroupAnonymousBot as Via.
     via_url = None
     via_text = "Via"
-    if via_user is not None:
+    if via_chat is not None:
+        via_text = _chat_title(via_chat) or "Via"
+        via_url = _chat_url(via_chat)
+    elif via_user is not None:
         uname = getattr(via_user, "username", None)
         uid = getattr(via_user, "id", None)
-        if uname:
+        if uname and uname != "GroupAnonymousBot":
             via_url = f"https://t.me/{uname}"
         elif uid:
             via_url = f"tg://user?id={uid}"
-    if not via_url:
+    if not via_url and via_text == "Via":
         via_url = f"https://t.me/{BOT_USERNAME}?start={VIA_START_PARAM}"
 
-    src_link = f"🎬 <a href=\"{html.escape(source_url, quote=True)}\">Джерело</a>"
-    via_link = f"<a href=\"{html.escape(via_url, quote=True)}\">{html.escape(via_text)}</a>"
+    src_link = f'🎬 <a href="{html.escape(source_url, quote=True)}">Джерело</a>'
+    if via_url:
+        via_link = f'<a href="{html.escape(via_url, quote=True)}">{html.escape(via_text)}</a>'
+    else:
+        via_link = html.escape(via_text)
 
-    login = (result.uploader_id or "").lstrip("@")
+    login = _author_login(result)
     author_url = _author_url(result)
-    if login and author_url:
-        author_link = f"👤 <a href=\"{html.escape(author_url, quote=True)}\">@{html.escape(login)}</a>"
+    if login:
+        # Do not make the source channel clickable. Telegram auto-links plain
+        # @username, so render it as <code> for tap/select/copy instead.
+        author_link = f"👤 <code>@{html.escape(login)}</code>"
     elif author_url:
         author_link = f"👤 <a href=\"{html.escape(author_url, quote=True)}\">Автор</a>"
     else:
@@ -112,7 +289,9 @@ def build_caption(result, via_user=None, show_tags=False, show_source_channel=Fa
     # Skip the duplicate @login when the credit line already shows the author.
     quote_lines = []
     if show_source_channel and login and caption_mode != "author":
-        quote_lines.append(f"@{html.escape(login)}")
+        # Plain @username becomes clickable in Telegram. <code> keeps it
+        # non-clickable and easy to copy.
+        quote_lines.append(f"📋 <code>@{html.escape(login)}</code>")
     tags = result.tags or []
     if show_tags and tags:
         tag_str = " ".join("#" + html.escape(str(t).lstrip("#")) for t in tags if t)
@@ -131,7 +310,7 @@ def build_caption(result, via_user=None, show_tags=False, show_source_channel=Fa
         if geo:
             parts.append(f"🌍 {html.escape(geo)}")
     elif desc_mode in ("with", "quote"):
-        desc = (result.description or "").strip()
+        desc = _clean_source_description(result.description or "")
         if desc:
             desc = html.escape(desc)
             if desc_mode == "quote":
@@ -149,10 +328,135 @@ async def _platform_enabled(platform: str) -> bool:
         "youtube": "feature_youtube",
         "instagram": "feature_instagram",
         "tiktok": "feature_tiktok",
+        "threads": "feature_threads",
     }.get(platform)
     if not key:
         return True
     return await get_setting(key, "1") == "1"
+
+
+async def _effective_chat_language(chat_id: int, user_id: int) -> str:
+    """Language for messages in this chat: per-group language or user language."""
+    # Telegram group/supergroup/channel ids are negative. Private chats are user ids.
+    if chat_id < 0:
+        try:
+            g = await get_group_settings(chat_id)
+            if g and g.get("language"):
+                return g["language"]
+        except Exception:
+            pass
+    return await get_user_language(user_id)
+
+
+async def _effective_message_language(message: Message, user_id: int) -> str:
+    if message.chat.type in ("group", "supergroup", "channel"):
+        g = await get_group_settings(message.chat.id)
+        if g is None:
+            await ensure_group_chat(
+                message.chat.id, message.chat.title, message.chat.type,
+                language=await get_user_language(user_id),
+            )
+            g = await get_group_settings(message.chat.id)
+        if g and g.get("language"):
+            return g["language"]
+    return await get_user_language(user_id)
+
+
+def _is_instagram_access_error(error: str) -> bool:
+    """True for common yt-dlp Instagram login/cookie/access failures."""
+    err = (error or "").lower()
+    needles = (
+        "empty media response",
+        "without being logged-in",
+        "login required",
+        "please log in",
+        "cookies",
+        "challenge_required",
+        "checkpoint_required",
+        "requested content is not available",
+        "unable to extract shared data",
+    )
+    return any(n in err for n in needles)
+
+
+def _instagram_access_message(lang: str, url: str, error: str = "") -> str:
+    link = html.escape(url or "", quote=True)
+    if lang == "uk":
+        return (
+            "❌ <b>Instagram не віддав медіа.</b>\n\n"
+            f"<a href=\"{link}\">Відкрити пост</a>\n\n"
+            "Найчастіше причина — Instagram вимагає авторизацію або cookies застаріли. "
+            "Адміну потрібно оновити Instagram cookies командою /refreshcookies і спробувати ще раз."
+        )
+    if lang == "en":
+        return (
+            "❌ <b>Instagram did not return media.</b>\n\n"
+            f"<a href=\"{link}\">Open post</a>\n\n"
+            "Most likely Instagram requires login or the cookies are expired. "
+            "Admin should refresh Instagram cookies with /refreshcookies and try again."
+        )
+    return (
+        "❌ <b>Instagram не отдал медиа.</b>\n\n"
+        f"<a href=\"{link}\">Открыть пост</a>\n\n"
+        "Чаще всего причина — Instagram требует авторизацию или cookies устарели. "
+        "Админу нужно обновить Instagram cookies командой /refreshcookies и попробовать ещё раз."
+    )
+
+def _instagram_preview_fallback_text(lang: str, url: str) -> str:
+    """Shown when IG metadata lookup fails, but direct download may still work."""
+    link = html.escape(url or "", quote=True)
+    if lang == "uk":
+        return (
+            "⚠️ <b>Instagram не віддав попередній перегляд.</b>\n\n"
+            f"<a href=\"{link}\">Відкрити пост</a>\n\n"
+            "Але це ще не означає, що скачування неможливе. Обери формат — бот спробує скачати напряму."
+        )
+    if lang == "en":
+        return (
+            "⚠️ <b>Instagram did not return preview info.</b>\n\n"
+            f"<a href=\"{link}\">Open post</a>\n\n"
+            "This does not always mean the reel is unavailable. Choose a format and the bot will try direct download."
+        )
+    return (
+        "⚠️ <b>Instagram не отдал предпросмотр.</b>\n\n"
+        f"<a href=\"{link}\">Открыть пост</a>\n\n"
+        "Это ещё не значит, что рилс недоступен. Выбери формат — бот попробует скачать напрямую."
+    )
+
+
+
+
+def _is_image_file(path: str) -> bool:
+    return str(path or "").lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+
+
+def _threads_text_fallback(info: dict | None, url: str) -> str:
+    """Render a Threads text-only post when there is no media file."""
+    link = html.escape(url or "", quote=True)
+    title = html.escape(str((info or {}).get("title") or "Threads post")[:500])
+    desc = html.escape(str((info or {}).get("description") or "")[:3000])
+    uploader = html.escape(str((info or {}).get("uploader") or ""))
+    parts = ["🧵 <b>Threads</b>"]
+    if uploader:
+        parts.append(f"👤 {uploader}")
+    if desc and desc != title:
+        parts.append(f"<blockquote>{desc}</blockquote>")
+    elif title:
+        parts.append(f"<blockquote>{title}</blockquote>")
+    parts.append(f'<a href="{link}">Открыть пост</a>')
+    return "\n".join(parts)
+
+
+async def _refresh_instagram_cookies_best_effort() -> bool:
+    """Try to refresh Instagram cookies if the project has services.cookies."""
+    try:
+        from services.cookies import refresh_cookies
+    except Exception:
+        return False
+    try:
+        return bool(await refresh_cookies())
+    except Exception:
+        return False
 
 
 def format_size(size_bytes: int) -> str:
@@ -173,11 +477,73 @@ def format_duration(seconds: int) -> str:
         return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
 
 
+# ─── Download progress indicator ────────────────────────────
+def _progress_bar(percent: int, width: int = 12) -> str:
+    """Return a compact Telegram-friendly progress bar."""
+    percent = max(0, min(100, int(percent)))
+    filled = round(width * percent / 100)
+    return "█" * filled + "░" * (width - filled)
+
+
+def _progress_text(lang: str, percent: int, stage: str = "download") -> str:
+    """Visual progress text shown while yt-dlp is running.
+
+    This is an indeterminate progress indicator: without a downloader callback
+    we cannot know the exact byte percentage, so it advances up to 95% while the
+    task is alive, then switches to upload when the download finishes.
+    """
+    labels = {
+        "ru": {
+            "download": "📥 <b>Скачиваю...</b>",
+            "upload": "📤 <b>Загружаю в Telegram...</b>",
+            "wait": "⏳ Это может занять время",
+        },
+        "uk": {
+            "download": "📥 <b>Завантажую...</b>",
+            "upload": "📤 <b>Відправляю в Telegram...</b>",
+            "wait": "⏳ Це може зайняти час",
+        },
+        "en": {
+            "download": "📥 <b>Downloading...</b>",
+            "upload": "📤 <b>Uploading to Telegram...</b>",
+            "wait": "⏳ This may take a while",
+        },
+    }
+    tr = labels.get(lang, labels["en"])
+    return f"{tr.get(stage, tr['download'])}\n<code>{_progress_bar(percent)}</code> {percent}%\n{tr['wait']}"
+
+
+async def _animate_download_progress(status_msg, lang: str, stop_event: asyncio.Event):
+    """Edit the status message every few seconds while the download is active.
+
+    Telegram rate-limits frequent edits, so keep updates slow and ignore edit
+    errors (for example, if text did not change or the message was deleted).
+    """
+    percent = 3
+    # Slows down over time and caps at 95% until the real task completes.
+    increments = [7, 8, 6, 7, 5, 6, 4, 5, 4, 3, 3, 2, 2, 2, 1]
+    idx = 0
+    while not stop_event.is_set():
+        try:
+            await status_msg.edit_text(_progress_text(lang, percent), parse_mode="HTML")
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=2.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+        if percent < 95:
+            inc = increments[idx] if idx < len(increments) else 1
+            idx += 1
+            percent = min(95, percent + inc)
+
+
 @router.message(F.text.regexp(r"^@[\w.]{1,30}$"))
 async def handle_username(message: Message, bot: Bot):
     """Handle @username - fetch all Instagram stories."""
     user_id = message.from_user.id
-    lang = await get_user_language(user_id)
+    lang = await _effective_message_language(message, user_id)
     username = message.text.strip().lstrip("@")
 
     if await get_setting("feature_bulk_stories", "1") != "1" or await get_setting("feature_instagram", "1") != "1":
@@ -193,9 +559,9 @@ async def handle_username(message: Message, bot: Bot):
     await handle_bulk_stories(message, bot, url, user_id)
 
 
-async def handle_bulk_stories(message: Message, bot: Bot, url: str, user_id: int):
+async def handle_bulk_stories(message: Message, bot: Bot, url: str, user_id: int, lang: str = None):
     """Handle bulk story download for instagram.com/stories/username/"""
-    lang = await get_user_language(user_id)
+    lang = lang or await _effective_message_language(message, user_id)
     loading = await message.answer(t(lang, "fetching_stories"))
 
     stories = await get_stories_list(url)
@@ -262,8 +628,20 @@ async def handle_bulk_stories(message: Message, bot: Bot, url: str, user_id: int
 @router.message(F.text.regexp(r"https?://\S+"))
 async def handle_link(message: Message, bot: Bot):
     user_id = message.from_user.id
-    lang = await get_user_language(user_id)
-    url = message.text.strip()
+    url = _normalize_threads_url(message.text)
+
+    is_group = message.chat.type in ("group", "supergroup", "channel")
+    group_settings = None
+    if is_group:
+        group_settings = await get_group_settings(message.chat.id)
+        if group_settings is None:
+            # Register old/lazy chats and default their language to the sender's language.
+            await ensure_group_chat(
+                message.chat.id, message.chat.title, message.chat.type,
+                language=await get_user_language(user_id),
+            )
+            group_settings = await get_group_settings(message.chat.id)
+    lang = (group_settings.get("language") if group_settings else None) or await get_user_language(user_id)
 
     if is_downloading(user_id):
         await message.reply(t(lang, "already_downloading"))
@@ -287,33 +665,30 @@ async def handle_link(message: Message, bot: Bot):
         return
 
     if platform == "instagram" and "stories/" in url and not video_id.isdigit():
-        await handle_bulk_stories(message, bot, url, user_id)
+        await handle_bulk_stories(message, bot, url, user_id, lang=lang)
         return
 
     # Decide whether to auto-download or show the quality/format buttons.
     #   • In groups/channels: the admin's group_download_mode applies.
     #   • In private chats: the user's personal download_mode applies
     #     (set in their ⚙️ Settings menu). Default "ask" shows buttons.
-    is_group = message.chat.type in ("group", "supergroup", "channel")
     if is_group:
         # Per-group download mode (set by the group's admin in "My groups").
-        g = await get_group_settings(message.chat.id)
-        if g is None:
-            # Chat existed before this feature — register it now so it shows up
-            # for whoever opens the group list later. added_by stays unknown.
-            await ensure_group_chat(message.chat.id, message.chat.title, message.chat.type)
-            g = await get_group_settings(message.chat.id)
+        g = group_settings
         auto_mode = g["download_mode"] if g else await get_setting("group_download_mode", "ask")
     else:
         auto_mode = await get_user_download_mode(user_id)
 
     if auto_mode in ("video", "audio"):
-        quality = "audio" if auto_mode == "audio" else "best"
+        # Free auto-video mode should use the same free quality as the
+        # "📱 480p (Free)" button, not unrestricted best quality. Premium
+        # qualities still go through Stars via handlers/stars.py.
+        quality = "audio" if auto_mode == "audio" else "480"
         loading = await message.reply(t(lang, "analyzing"))
         short_id = store_url(url, platform)
         await process_quality_download(
             bot, user_id, quality, short_id, message.chat.id, loading,
-            via_user=message.from_user, reply_to_message_id=message.message_id,
+            via_user=_message_via_user(message), via_chat=_message_via_chat(message), reply_to_message_id=message.message_id,
         )
         return
 
@@ -331,7 +706,24 @@ async def handle_link(message: Message, bot: Bot):
     info = await get_info(url, platform)
     if not info:
         if platform == "instagram":
-            await loading.edit_text(t(lang, "ig_cant_access"), parse_mode="HTML")
+            # Instagram often blocks metadata/preview requests even when direct
+            # media download still succeeds. Do not stop here with "no access";
+            # show quality buttons and let process_quality_download try directly.
+            await loading.edit_text(
+                _instagram_preview_fallback_text(lang, url),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=quality_keyboard(store_url(url, platform), platform),
+            )
+        elif platform == "threads":
+            # Threads metadata can fail while direct yt-dlp download may still
+            # work. Let the user try a direct download instead of stopping.
+            await loading.edit_text(
+                "🧵 <b>Threads не отдал предпросмотр.</b>\n\nПопробуй скачать напрямую.",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=quality_keyboard(store_url(url, platform), platform),
+            )
         else:
             await loading.edit_text(t(lang, "cant_fetch"))
         return
@@ -373,13 +765,15 @@ async def process_download(callback: CallbackQuery, bot: Bot):
     reply_to_id = orig.message_id if orig else None
     await process_quality_download(
         bot, user_id, quality, short_id, callback.message.chat.id, callback.message,
-        via_user=callback.from_user, reply_to_message_id=reply_to_id,
+        via_user=_message_via_user(orig) or callback.from_user,
+        via_chat=_message_via_chat(orig),
+        reply_to_message_id=reply_to_id,
     )
 
 
-async def process_quality_download(bot: Bot, user_id: int, quality: str, short_id: str, chat_id: int, edit_msg=None, via_user=None, reply_to_message_id=None):
+async def process_quality_download(bot: Bot, user_id: int, quality: str, short_id: str, chat_id: int, edit_msg=None, via_user=None, via_chat=None, reply_to_message_id=None):
     """Download logic shared between regular and premium (Stars-paid) downloads."""
-    lang = await get_user_language(user_id)
+    lang = await _effective_chat_language(chat_id, user_id)
     audio_only = quality == "audio"
 
     url_data = get_url(short_id)
@@ -391,6 +785,7 @@ async def process_quality_download(bot: Bot, user_id: int, quality: str, short_i
             await bot.send_message(chat_id, msg)
         return
     url, platform = url_data
+    url = _normalize_threads_url(url)
 
     # Personal preferences only apply in private chats (chat_id > 0). In groups
     # the per-group settings drive caption behaviour instead.
@@ -407,9 +802,9 @@ async def process_quality_download(bot: Bot, user_id: int, quality: str, short_i
             return
 
     if edit_msg:
-        status_msg = await edit_msg.edit_text(t(lang, "downloading"), parse_mode="HTML")
+        status_msg = await edit_msg.edit_text(_progress_text(lang, 3), parse_mode="HTML")
     else:
-        status_msg = await bot.send_message(chat_id, t(lang, "downloading"), parse_mode="HTML")
+        status_msg = await bot.send_message(chat_id, _progress_text(lang, 3), parse_mode="HTML")
 
     # Photo carousel / slideshow delivery prefs (private chats only; groups get
     # the default album + no separate audio).
@@ -421,7 +816,7 @@ async def process_quality_download(bot: Bot, user_id: int, quality: str, short_i
         try:
             return await process_gallery(
                 bot, user_id, url, platform, gal, chat_id, status_msg,
-                via_user=via_user, reply_to_message_id=reply_to_message_id,
+                via_user=via_user, via_chat=via_chat, reply_to_message_id=reply_to_message_id,
                 gallery_mode=gallery_mode, audio_mode=audio_mode,
             )
         finally:
@@ -440,31 +835,78 @@ async def process_quality_download(bot: Bot, user_id: int, quality: str, short_i
             cleanup_gallery(gal)
 
     async def do_download():
-        return await download(url, platform, audio_only=audio_only, quality=quality, watermark=watermark)
+        return await _download_compat(url, platform, audio_only=audio_only, quality=quality, watermark=watermark)
 
     task = asyncio.create_task(do_download())
+    progress_stop = asyncio.Event()
+    progress_task = asyncio.create_task(_animate_download_progress(status_msg, lang, progress_stop))
     set_active(user_id, task)
 
     try:
         result = await task
     except asyncio.CancelledError:
+        progress_stop.set()
+        progress_task.cancel()
         await status_msg.edit_text(t(lang, "cancelled"))
         return
     finally:
+        progress_stop.set()
+        try:
+            await progress_task
+        except asyncio.CancelledError:
+            pass
         clear_active(user_id)
 
     if not result.success:
-        # Fallback: a photo carousel / TikTok slideshow has no playable video,
-        # so the normal download fails — try a gallery download instead.
-        if not audio_only and platform in ("tiktok", "instagram"):
-            gal = await download_gallery(url, platform)
-            if gal and gal.success:
-                await _run_gallery(gal)
+        # Instagram sometimes returns "empty media response" when cookies are
+        # missing/expired. Try refreshing cookies once, then retry the download.
+        if platform == "instagram" and _is_instagram_access_error(result.error):
+            await status_msg.edit_text("🔄 <b>Обновляю Instagram cookies...</b>", parse_mode="HTML")
+            if await _refresh_instagram_cookies_best_effort():
+                retry = await _download_compat(url, platform, audio_only=audio_only, quality=quality, watermark=watermark)
+                if retry.success:
+                    result = retry
+                else:
+                    result = retry
+
+        if not result.success:
+            # Fallback: a photo carousel / TikTok slideshow has no playable video,
+            # so the normal download fails — try a gallery download instead.
+            if not audio_only and platform in ("tiktok", "instagram"):
+                gal = await download_gallery(url, platform)
+                if gal and gal.success:
+                    await _run_gallery(gal)
+                    return
+                cleanup_gallery(gal)
+
+            if platform == "instagram" and _is_instagram_access_error(result.error):
+                await status_msg.edit_text(
+                    _instagram_access_message(lang, url, result.error),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
                 return
-            cleanup_gallery(gal)
-        error_text = result.error[:150] if result.error else "Unknown error"
-        await status_msg.edit_text(t(lang, "dl_failed", error=error_text), parse_mode="HTML")
-        return
+
+            if platform == "threads":
+                # Threads may be a text-only post or yt-dlp may expose only
+                # metadata. In that case, forward the message text/link instead
+                # of failing with a generic download error.
+                try:
+                    info = await get_info(url, platform)
+                except Exception:
+                    info = None
+                if info:
+                    await status_msg.edit_text(
+                        _threads_text_fallback(info, url),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                    await record_download(user_id, url, platform, (info or {}).get("title") or "Threads post", 0, chat_id=chat_id)
+                    return
+
+            error_text = result.error[:150] if result.error else "Unknown error"
+            await status_msg.edit_text(t(lang, "dl_failed", error=error_text), parse_mode="HTML")
+            return
 
     # Effective caption flags + per-group "delete user's link" behaviour.
     cfg = await _resolve_caption_config(chat_id, user_id, user_prefs)
@@ -485,7 +927,7 @@ async def process_quality_download(bot: Bot, user_id: int, quality: str, short_i
         """Send the post description as its own message (desc_mode='separate')."""
         if desc_mode != "separate":
             return
-        text = (result.description or "").strip()
+        text = _clean_source_description(result.description or "")
         if not text:
             return
         try:
@@ -536,11 +978,11 @@ async def process_quality_download(bot: Bot, user_id: int, quality: str, short_i
         cleanup_file(result.file_path)
         return
 
-    await status_msg.edit_text(t(lang, "uploading"), parse_mode="HTML")
+    await status_msg.edit_text(_progress_text(lang, 100, "upload"), parse_mode="HTML")
 
     try:
         caption = build_caption(
-            result, via_user=via_user,
+            result, via_user=via_user, via_chat=via_chat,
             show_tags=show_tags, show_source_channel=show_source_channel,
             caption_mode=caption_mode, desc_mode=desc_mode,
         )
@@ -550,6 +992,11 @@ async def process_quality_download(bot: Bot, user_id: int, quality: str, short_i
             await bot.send_audio(
                 chat_id=chat_id, audio=file, caption=caption, parse_mode="HTML",
                 reply_to_message_id=reply_to_message_id,
+            )
+        elif _is_image_file(result.file_path):
+            await bot.send_photo(
+                chat_id=chat_id, photo=file, caption=caption,
+                parse_mode="HTML", reply_to_message_id=reply_to_message_id,
             )
         else:
             await bot.send_video(
@@ -590,6 +1037,8 @@ async def _resolve_caption_config(chat_id: int, user_id: int, user_prefs=None) -
             cfg["show_tags"] = admin_tags or g["show_tags"]
             cfg["show_source_channel"] = admin_channel or g["show_source_channel"]
             cfg["delete_user_url"] = g["delete_user_url"]
+            cfg["caption_mode"] = g.get("caption_mode", "src_via")
+            cfg["desc_mode"] = g.get("description_mode", "off")
     else:
         if user_prefs is None:
             user_prefs = await get_user_settings(user_id)
@@ -602,7 +1051,7 @@ async def _resolve_caption_config(chat_id: int, user_id: int, user_prefs=None) -
 
 async def process_gallery(bot: Bot, user_id: int, url: str, platform: str,
                           gallery: GalleryResult, chat_id: int, status_msg,
-                          via_user=None, reply_to_message_id=None,
+                          via_user=None, via_chat=None, reply_to_message_id=None,
                           gallery_mode: str = "photos", audio_mode: str = "off"):
     """Send a downloaded photo carousel / slideshow post.
 
@@ -611,11 +1060,11 @@ async def process_gallery(bot: Bot, user_id: int, url: str, platform: str,
                             post's music.
     audio_mode='separate' → also send the post's audio as a standalone .mp3.
     """
-    lang = await get_user_language(user_id)
+    lang = await _effective_chat_language(chat_id, user_id)
     cfg = await _resolve_caption_config(chat_id, user_id)
 
     caption = build_caption(
-        gallery, via_user=via_user,
+        gallery, via_user=via_user, via_chat=via_chat,
         show_tags=cfg["show_tags"], show_source_channel=cfg["show_source_channel"],
         caption_mode=cfg["caption_mode"], desc_mode=cfg["desc_mode"],
     )
@@ -626,7 +1075,7 @@ async def process_gallery(bot: Bot, user_id: int, url: str, platform: str,
     slideshow_path = None
 
     try:
-        await status_msg.edit_text(t(lang, "uploading"), parse_mode="HTML")
+        await status_msg.edit_text(_progress_text(lang, 100, "upload"), parse_mode="HTML")
     except Exception:
         pass
 

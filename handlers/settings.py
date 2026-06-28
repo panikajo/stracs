@@ -7,14 +7,10 @@ from aiogram.filters import Command
 from database.db import (
     get_or_create_user, get_user_language, set_user_language,
     get_user_settings, toggle_user_flag, set_user_download_mode, get_setting,
-    set_user_description_mode, set_user_caption_mode,
-    set_user_gallery_mode, set_user_audio_mode,
-    VALID_GALLERY_MODES, VALID_AUDIO_MODES,
 )
 from services.i18n import t, LANGUAGES
 from keyboards.inline import (
     settings_keyboard, settings_language_keyboard, settings_mode_keyboard,
-    settings_caption_keyboard, settings_description_keyboard,
 )
 
 router = Router()
@@ -141,59 +137,6 @@ async def settings_callbacks(callback: CallbackQuery):
     elif action == "setmode":
         mode = parts[2] if len(parts) > 2 else "ask"
         await set_user_download_mode(callback.from_user.id, mode)
-        await _render_panel(callback, lang)
-        await callback.answer(t(lang, "setting_saved"))
-
-    elif action == "caption":
-        settings = await get_user_settings(callback.from_user.id)
-        try:
-            await callback.message.edit_text(
-                t(lang, "choose_caption"),
-                parse_mode="HTML",
-                reply_markup=settings_caption_keyboard(lang, settings["caption_mode"]),
-            )
-        except Exception:
-            pass
-        await callback.answer()
-
-    elif action == "setcaption":
-        mode = parts[2] if len(parts) > 2 else "src_via"
-        await set_user_caption_mode(callback.from_user.id, mode)
-        await _render_panel(callback, lang)
-        await callback.answer(t(lang, "setting_saved"))
-
-    elif action == "desc":
-        settings = await get_user_settings(callback.from_user.id)
-        try:
-            await callback.message.edit_text(
-                t(lang, "choose_desc"),
-                parse_mode="HTML",
-                reply_markup=settings_description_keyboard(lang, settings["description_mode"]),
-            )
-        except Exception:
-            pass
-        await callback.answer()
-
-    elif action == "setdesc":
-        mode = parts[2] if len(parts) > 2 else "off"
-        await set_user_description_mode(callback.from_user.id, mode)
-        await _render_panel(callback, lang)
-        await callback.answer(t(lang, "setting_saved"))
-
-    elif action == "cycle":
-        # Two-value settings toggled in place.
-        which = parts[2] if len(parts) > 2 else ""
-        settings = await get_user_settings(callback.from_user.id)
-        if which == "gallery":
-            cur = settings.get("gallery_mode", "photos")
-            nxt = VALID_GALLERY_MODES[(VALID_GALLERY_MODES.index(cur) + 1) % len(VALID_GALLERY_MODES)] \
-                if cur in VALID_GALLERY_MODES else VALID_GALLERY_MODES[0]
-            await set_user_gallery_mode(callback.from_user.id, nxt)
-        elif which == "audio":
-            cur = settings.get("audio_mode", "off")
-            nxt = VALID_AUDIO_MODES[(VALID_AUDIO_MODES.index(cur) + 1) % len(VALID_AUDIO_MODES)] \
-                if cur in VALID_AUDIO_MODES else VALID_AUDIO_MODES[0]
-            await set_user_audio_mode(callback.from_user.id, nxt)
         await _render_panel(callback, lang)
         await callback.answer(t(lang, "setting_saved"))
 

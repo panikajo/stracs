@@ -11,7 +11,15 @@ except ImportError:
 class Config:
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
     ADMIN_ID: int = int(os.getenv("ADMIN_ID", "519613720"))
+    # Database: "sqlite" (default) or "mysql"
+    DB_TYPE: str = os.getenv("DB_TYPE", "sqlite").lower()
     DB_PATH: str = os.getenv("DB_PATH", "data/smdown.db")
+    MYSQL_HOST: str = os.getenv("MYSQL_HOST", "127.0.0.1")
+    MYSQL_PORT: int = int(os.getenv("MYSQL_PORT", "3306"))
+    MYSQL_USER: str = os.getenv("MYSQL_USER", "smdownbot")
+    MYSQL_PASSWORD: str = os.getenv("MYSQL_PASSWORD", "")
+    MYSQL_DATABASE: str = os.getenv("MYSQL_DATABASE", "smdownbot")
+    MYSQL_CHARSET: str = os.getenv("MYSQL_CHARSET", "utf8mb4")
     DOWNLOAD_DIR: str = os.getenv("DOWNLOAD_DIR", "downloads")
     MAX_FILE_SIZE: int = 50 * 1024 * 1024       # 50MB Telegram bot limit
     PREMIUM_FILE_SIZE: int = 2 * 1024 * 1024 * 1024  # 2GB for premium

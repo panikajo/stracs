@@ -15,18 +15,20 @@ from aiogram.filters import Command, ChatMemberUpdatedFilter, JOIN_TRANSITION, L
 from database.db import (
     get_or_create_user, get_user_language, get_setting,
     ensure_group_chat, set_group_inactive, get_group_settings,
-    list_active_groups, claim_group,
-    toggle_group_flag, set_group_download_mode,
+    list_active_groups,
+    toggle_group_flag, set_group_download_mode, set_group_description_mode,
+    set_group_caption_mode, set_group_language,
 )
 from services.i18n import t, LANGUAGES
 from keyboards.inline import (
     groups_list_keyboard, group_settings_keyboard, group_mode_keyboard,
+    group_description_keyboard, group_caption_keyboard, group_language_keyboard,
 )
 
 router = Router()
 
 _GROUP_TYPES = ("group", "supergroup", "channel")
-_ADMIN_STATUSES = ("administrator", "creator")
+_CREATOR_STATUS = "creator"
 
 
 # ─── Auto-register any group/channel the bot is active in ───
@@ -63,27 +65,31 @@ def register_group_middleware(dp):
     dp.edited_message.outer_middleware(mw)
 
 
+async def _is_chat_creator(bot, chat_id: int, user_id: int) -> bool:
+    """Return True only for the real Telegram group/channel owner.
+
+    Administrators must not see or manage the chat in "My groups"; the owner
+    has member.status == "creator" in Telegram Bot API / aiogram.
+    """
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return getattr(member, "status", None) == _CREATOR_STATUS
+    except Exception:
+        return False
+
+
 async def _user_manageable_groups(bot, user_id: int) -> list:
-    """Groups the user may configure: ones they added, plus any active group
-    where they are currently an admin/creator. Unattributed groups they admin
-    get claimed so they list instantly next time."""
+    """Groups/chats this user may configure.
+
+    Show a group only to its real Telegram creator/owner, not to every admin.
+    This intentionally ignores historical added_by values when the user is no
+    longer the current creator, because admins can also add bots.
+    """
     groups = await list_active_groups()
     out = []
     for g in groups:
-        if g.get("added_by") == user_id:
+        if await _is_chat_creator(bot, g["chat_id"], user_id):
             out.append(g)
-            continue
-        try:
-            member = await bot.get_chat_member(g["chat_id"], user_id)
-        except Exception:
-            continue
-        if getattr(member, "status", None) in _ADMIN_STATUSES:
-            out.append(g)
-            if g.get("added_by") is None:
-                try:
-                    await claim_group(g["chat_id"], user_id)
-                except Exception:
-                    pass
     return out
 
 
@@ -94,15 +100,21 @@ async def bot_added(event: ChatMemberUpdated):
     if event.chat.type not in _GROUP_TYPES:
         return
     adder = event.from_user.id if event.from_user else None
+    owner_id = None
+    group_lang = None
     if adder:
-        # Make sure the adder exists as a user so their /settings list works.
+        # Make sure the triggering user exists, but only store them as owner if
+        # Telegram says they are the real chat creator. Admins can add bots too.
         await get_or_create_user(
             adder,
             event.from_user.username,
             event.from_user.first_name,
         )
+        if await _is_chat_creator(event.bot, event.chat.id, adder):
+            owner_id = adder
+            group_lang = await get_user_language(adder)
     await ensure_group_chat(
-        event.chat.id, event.chat.title, event.chat.type, added_by=adder
+        event.chat.id, event.chat.title, event.chat.type, added_by=owner_id, language=group_lang
     )
 
 
@@ -138,17 +150,50 @@ async def cmd_mygroups(message: Message):
     await _show_group_list(message)
 
 
+@router.message(Command("registergroup", "registerchat"))
+async def cmd_register_group(message: Message):
+    """Manually bind the current group/chat to the admin after moving hosting/DB.
+
+    Telegram does not provide historical bot group membership. If the bot is
+    moved to a new server with an empty DB, admins can send /registergroup in
+    each group so it appears again in their private "My groups" list.
+    """
+    if message.chat.type not in _GROUP_TYPES:
+        await message.answer("Эту команду нужно отправить внутри группы/чата, который нужно привязать.")
+        return
+    if not message.from_user:
+        return
+
+    try:
+        member = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
+        if getattr(member, "status", None) != _CREATOR_STATUS:
+            await message.answer("❌ Привязать группу может только создатель/владелец этой группы, не обычный админ.")
+            return
+    except Exception:
+        await message.answer("❌ Не смог проверить, что вы создатель этой группы.")
+        return
+
+    await get_or_create_user(
+        message.from_user.id,
+        message.from_user.username,
+        message.from_user.first_name,
+    )
+    await ensure_group_chat(
+        message.chat.id,
+        message.chat.title or str(message.chat.id),
+        message.chat.type,
+        added_by=message.from_user.id,
+        language=await get_user_language(message.from_user.id),
+    )
+    await message.answer(
+        "✅ Группа привязана. Теперь откройте личный чат с ботом → ⚙️ Настройки → 👥 Мои группы/чаты."
+    )
+
+
 # ─── Callback router for per-group settings (gset:) ─────────
 async def _can_manage(callback: CallbackQuery, g: dict) -> bool:
-    """The adder may always manage; otherwise check live group-admin status."""
-    uid = callback.from_user.id
-    if g.get("added_by") == uid:
-        return True
-    try:
-        member = await callback.bot.get_chat_member(g["chat_id"], uid)
-        return member.status in ("administrator", "creator")
-    except Exception:
-        return False
+    """Only the real Telegram creator/owner may manage group settings."""
+    return await _is_chat_creator(callback.bot, g["chat_id"], callback.from_user.id)
 
 
 async def _render_group_list(callback: CallbackQuery, lang: str):
@@ -247,6 +292,62 @@ async def group_callbacks(callback: CallbackQuery):
     elif action == "setmode":
         mode = parts[3] if len(parts) > 3 else "ask"
         await set_group_download_mode(chat_id, mode)
+        g = await get_group_settings(chat_id)
+        await _render_group_panel(callback, lang, g)
+        await callback.answer(t(lang, "setting_saved"))
+
+    elif action == "lang":
+        try:
+            await callback.message.edit_text(
+                t(lang, "choose_language"),
+                parse_mode="HTML",
+                reply_markup=group_language_keyboard(lang, g.get("language", "en"), chat_id),
+            )
+        except Exception:
+            pass
+        await callback.answer()
+
+    elif action == "setlang":
+        code = parts[3] if len(parts) > 3 else "en"
+        if code not in LANGUAGES:
+            code = "en"
+        await set_group_language(chat_id, code)
+        g = await get_group_settings(chat_id)
+        await _render_group_panel(callback, lang, g)
+        await callback.answer(t(lang, "setting_saved"))
+
+    elif action == "caption":
+        try:
+            await callback.message.edit_text(
+                t(lang, "choose_caption"),
+                parse_mode="HTML",
+                reply_markup=group_caption_keyboard(lang, g.get("caption_mode", "src_via"), chat_id),
+            )
+        except Exception:
+            pass
+        await callback.answer()
+
+    elif action == "setcaption":
+        mode = parts[3] if len(parts) > 3 else "src_via"
+        await set_group_caption_mode(chat_id, mode)
+        g = await get_group_settings(chat_id)
+        await _render_group_panel(callback, lang, g)
+        await callback.answer(t(lang, "setting_saved"))
+
+    elif action == "desc":
+        try:
+            await callback.message.edit_text(
+                t(lang, "choose_desc"),
+                parse_mode="HTML",
+                reply_markup=group_description_keyboard(lang, g.get("description_mode", "off"), chat_id),
+            )
+        except Exception:
+            pass
+        await callback.answer()
+
+    elif action == "setdesc":
+        mode = parts[3] if len(parts) > 3 else "off"
+        await set_group_description_mode(chat_id, mode)
         g = await get_group_settings(chat_id)
         await _render_group_panel(callback, lang, g)
         await callback.answer(t(lang, "setting_saved"))

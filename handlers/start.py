@@ -74,7 +74,7 @@ async def btn_help(message: Message):
 
 
 # Order platforms are listed in the chat-stats message.
-_PLATFORM_ORDER = ["youtube", "instagram", "tiktok"]
+_PLATFORM_ORDER = ["youtube", "instagram", "tiktok", "threads"]
 
 
 def _platform_lines(counts: dict) -> str:

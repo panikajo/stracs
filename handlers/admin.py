@@ -1,3 +1,4 @@
+import html
 import logging
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -6,6 +7,7 @@ from database.db import (
     get_stats, ban_user, get_or_create_user, get_all_users,
     get_recent_downloads, get_user_by_id, set_user_limit, get_daily_stats,
     get_all_settings, toggle_setting, get_user_language,
+    list_user_groups, get_user_group_count, get_recent_payments,
 )
 from services.i18n_admin import ta
 from config import config
@@ -24,12 +26,12 @@ async def _lang(uid: int) -> str:
 
 
 # ─── Main Admin Panel ───────────────────────────────────────
-@router.message(Command("admin"))
-async def cmd_admin(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    lang = await _lang(message.from_user.id)
-    stats = await get_stats()
+def _admin_panel(lang: str, stats: dict) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the admin dashboard text and keyboard.
+
+    Used by both /admin and inline Back button. Do not call cmd_admin()
+    from callbacks: callback.message.from_user is the bot, not the admin.
+    """
     text = ta(lang, "dashboard", users=stats["total_users"],
               today=stats["today_downloads"], total=stats["total_downloads"])
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -45,7 +47,19 @@ async def cmd_admin(message: Message):
             InlineKeyboardButton(text=ta(lang, "btn_find"), callback_data="adm:find"),
             InlineKeyboardButton(text=ta(lang, "btn_settings"), callback_data="adm:settings"),
         ],
+        [
+            InlineKeyboardButton(text="⭐ Платежи", callback_data="adm:payments"),
+        ],
     ])
+    return text, kb
+
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    lang = await _lang(message.from_user.id)
+    text, kb = _admin_panel(lang, await get_stats())
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
@@ -77,19 +91,24 @@ async def admin_callbacks(callback: CallbackQuery):
         await set_limit(callback, lang, int(parts[2]), int(parts[3]))
     elif action == "userinfo":
         await show_user_info(callback, lang, int(parts[2]))
+    elif action == "usergroups":
+        await show_user_groups(callback, lang, int(parts[2]))
+    elif action == "payments":
+        await show_payments(callback, lang)
     elif action == "find":
         await callback.answer(ta(lang, "find_hint"), show_alert=True)
     elif action == "settings":
         await show_settings(callback, lang)
     elif action == "toggle":
         await toggle_feature(callback, lang, parts[2])
-    elif action == "gmode":
-        await cycle_group_mode(callback, lang)
     elif action == "broadcast":
         await callback.answer(ta(lang, "bc_hint"), show_alert=True)
     elif action == "back":
-        await callback.message.delete()
-        await cmd_admin(callback.message)
+        # callback.message.from_user is the bot, so calling cmd_admin(callback.message)
+        # fails the admin check and leaves the admin without a menu. Rebuild and
+        # edit the same message instead.
+        text, kb = _admin_panel(lang, await get_stats())
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     await callback.answer()
 
 
@@ -125,10 +144,16 @@ async def show_downloads(callback: CallbackQuery, lang: str, page: int = 0):
 
     lines = [ta(lang, "downloads_title") + "\n"]
     for d in chunk:
-        icon = {"youtube": "\U0001F534", "instagram": "\U0001F4F8", "tiktok": "\U0001F3B5"}.get(d["platform"], "\U0001F310")
-        title = (d["title"] or "")[:35]
+        icon = {"youtube": "\U0001F534", "instagram": "\U0001F4F8", "tiktok": "\U0001F3B5", "threads": "🧵"}.get(d["platform"], "\U0001F310")
+        title = (d["title"] or "Источник")[:35]
+        title_html = html.escape(title)
+        url = (d.get("url") or "").strip()
+        if url.startswith(("http://", "https://")):
+            source = f'<a href="{html.escape(url, quote=True)}">{title_html}</a>'
+        else:
+            source = title_html
         size = f"{d['file_size'] / 1024 / 1024:.1f}MB" if d["file_size"] else "N/A"
-        lines.append(f"{icon} <code>{d['user_id']}</code> \u2014 {title} ({size})")
+        lines.append(f"{icon} <code>{d['user_id']}</code> \u2014 {source} ({size})")
 
     text = "\n".join(lines) + "\n\n" + ta(lang, "page", page=page + 1, total=total_pages)
     buttons = []
@@ -173,7 +198,7 @@ def _user_info_text(lang: str, user: dict, title_key: str) -> str:
     )
 
 
-def _user_action_kb(lang: str, user: dict, back_cb: str) -> InlineKeyboardMarkup:
+def _user_action_kb(lang: str, user: dict, back_cb: str, groups_count: int | None = None) -> InlineKeyboardMarkup:
     uid = user["user_id"]
     ban_text = ta(lang, "btn_unban") if user["is_banned"] else ta(lang, "btn_ban")
     ban_action = f"adm:unban:{uid}" if user["is_banned"] else f"adm:ban:{uid}"
@@ -181,6 +206,9 @@ def _user_action_kb(lang: str, user: dict, back_cb: str) -> InlineKeyboardMarkup
         InlineKeyboardButton(text=ban_text, callback_data=ban_action),
         InlineKeyboardButton(text=ta(lang, "btn_setlimit"), callback_data=f"adm:limit:{uid}"),
     ]]
+    if groups_count is None or groups_count > 0:
+        label = "👥 Группы/чаты" if groups_count is None else f"👥 Группы/чаты ({groups_count})"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"adm:usergroups:{uid}")])
     if back_cb:
         rows.append([InlineKeyboardButton(text=ta(lang, "btn_back"), callback_data=back_cb)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -191,8 +219,13 @@ async def show_user_info(callback: CallbackQuery, lang: str, user_id: int):
     if not user:
         await callback.answer(ta(lang, "user_not_found"), show_alert=True)
         return
-    text = _user_info_text(lang, user, "userinfo_title") + f"{ta(lang, 'f_joined')}: {user['created_at']}\n"
-    kb = _user_action_kb(lang, user, "adm:users:0")
+    groups_count = await get_user_group_count(user_id)
+    text = (
+        _user_info_text(lang, user, "userinfo_title")
+        + f"{ta(lang, 'f_joined')}: {user['created_at']}\n"
+        + f"👥 Группы/чаты: <b>{groups_count}</b>\n"
+    )
+    kb = _user_action_kb(lang, user, "adm:users:0", groups_count=groups_count)
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
 
@@ -248,18 +281,99 @@ def user_buttons(users, page, total_pages, prefix, lang):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+
+
+# ─── User groups/chats in admin panel ───────────────────────
+def _chat_open_url(chat_id: int) -> str | None:
+    """Best-effort Telegram URL for supergroups/channels known by numeric id.
+
+    Telegram does not expose a universal public link for every private group to
+    bots. For -100... supergroups/channels, t.me/c/<internal_id>/1 opens the
+    chat for users who already have access.
+    """
+    raw = str(chat_id)
+    if raw.startswith("-100"):
+        return f"https://t.me/c/{raw[4:]}/1"
+    return None
+
+
+async def show_user_groups(callback: CallbackQuery, lang: str, user_id: int):
+    user = await get_user_by_id(user_id)
+    groups = await list_user_groups(user_id)
+    name = html.escape(str((user or {}).get("first_name") or (user or {}).get("username") or user_id))
+    lines = [f"👥 <b>Группы/чаты пользователя {name}</b>", f"User ID: <code>{user_id}</code>", f"Всего: <b>{len(groups)}</b>", ""]
+    rows = []
+    if not groups:
+        lines.append("Активные группы/чаты для этого пользователя не найдены.")
+    else:
+        for idx, g in enumerate(groups, 1):
+            title = g.get("title") or str(g["chat_id"])
+            safe_title = html.escape(str(title))
+            ctype = html.escape(str(g.get("chat_type") or "chat"))
+            lines.append(f"{idx}. {safe_title} — <code>{g['chat_id']}</code> ({ctype})")
+            url = _chat_open_url(int(g["chat_id"]))
+            if url:
+                rows.append([InlineKeyboardButton(text=f"↗️ {str(title)[:40]}", url=url)])
+    rows.append([InlineKeyboardButton(text=ta(lang, "btn_back"), callback_data=f"adm:userinfo:{user_id}")])
+    await callback.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+# ─── Payments in admin panel ────────────────────────────────
+async def show_payments(callback: CallbackQuery, lang: str):
+    payments = await get_recent_payments(20)
+    lines = ["⭐ <b>Последние Stars-платежи</b>", ""]
+    if not payments:
+        lines.append("Платежей пока нет.")
+    else:
+        for p in payments:
+            user = html.escape(str(p.get("first_name") or p.get("username") or p.get("user_id")))
+            quality = f" / {html.escape(str(p['quality']))}" if p.get("quality") else ""
+            lines.append(
+                f"• <b>{p.get('stars_amount', 0)}</b> XTR — {p.get('item_type')}{quality}\n"
+                f"  Пользователь: {user} (<code>{p.get('user_id')}</code>)\n"
+                f"  ID: <code>{p.get('telegram_payment_charge_id') or 'N/A'}</code>\n"
+                f"  {p.get('created_at')}"
+            )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=ta(lang, "btn_back"), callback_data="adm:back")]
+    ])
+    await callback.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+
+
+@router.message(Command("payments"))
+async def cmd_payments(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    class _Shim:
+        def __init__(self, message):
+            self.message = message
+    # Send a fresh message with the same content style as the callback panel.
+    payments = await get_recent_payments(20)
+    lines = ["⭐ <b>Последние Stars-платежи</b>", ""]
+    if not payments:
+        lines.append("Платежей пока нет.")
+    else:
+        for p in payments:
+            user = html.escape(str(p.get("first_name") or p.get("username") or p.get("user_id")))
+            quality = f" / {html.escape(str(p['quality']))}" if p.get("quality") else ""
+            lines.append(
+                f"• <b>{p.get('stars_amount', 0)}</b> XTR — {p.get('item_type')}{quality}\n"
+                f"  Пользователь: {user} (<code>{p.get('user_id')}</code>)\n"
+                f"  ID: <code>{p.get('telegram_payment_charge_id') or 'N/A'}</code>\n"
+                f"  {p.get('created_at')}"
+            )
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
 # ─── Settings (feature toggles) ─────────────────────────────
 SETTING_KEYS = {
     "feature_youtube": "set_youtube",
     "feature_instagram": "set_instagram",
     "feature_tiktok": "set_tiktok",
+    "feature_threads": "Threads",
     "feature_stars": "set_stars",
     "feature_bulk_stories": "set_bulk",
-    "feature_language_select": "set_lang",
     "feature_user_settings": "set_user_settings",
-    "feature_group_buttons": "set_group_buttons",
-    "feature_show_tags": "set_show_tags",
-    "feature_show_source_channel": "set_show_source_channel",
 }
 
 
@@ -274,35 +388,9 @@ async def show_settings(callback: CallbackQuery, lang: str):
             text=f"{ta(lang, label_key)} \u2014 {state}",
             callback_data=f"adm:toggle:{key}",
         )])
-    # 3-state cyclic setting: what to do with links in groups/channels
-    mode = settings.get("group_download_mode", "ask")
-    mode_label = ta(lang, {
-        "ask": "gmode_ask",
-        "video": "gmode_video",
-        "audio": "gmode_audio",
-    }.get(mode, "gmode_ask"))
-    rows.append([InlineKeyboardButton(
-        text=f"{ta(lang, 'set_group_mode')}: {mode_label}",
-        callback_data="adm:gmode",
-    )])
     rows.append([InlineKeyboardButton(text=ta(lang, "btn_back"), callback_data="adm:back")])
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-
-
-async def cycle_group_mode(callback: CallbackQuery, lang: str):
-    """Cycle the group/channel download mode: ask -> video -> audio -> ask."""
-    from database.db import get_setting, set_setting
-    cur = await get_setting("group_download_mode", "ask")
-    order = ["ask", "video", "audio"]
-    try:
-        nxt = order[(order.index(cur) + 1) % len(order)]
-    except ValueError:
-        nxt = "ask"
-    await set_setting("group_download_mode", nxt)
-    label = ta(lang, {"ask": "gmode_ask", "video": "gmode_video", "audio": "gmode_audio"}[nxt])
-    await callback.answer(f"{ta(lang, 'set_group_mode')}: {label}")
-    await show_settings(callback, lang)
 
 
 async def toggle_feature(callback: CallbackQuery, lang: str, key: str):
@@ -335,8 +423,9 @@ async def cmd_find(message: Message):
     if not user:
         await message.answer(ta(lang, "user_not_found"))
         return
-    text = _user_info_text(lang, user, "userfound_title")
-    kb = _user_action_kb(lang, user, "")
+    groups_count = await get_user_group_count(user["user_id"])
+    text = _user_info_text(lang, user, "userfound_title") + f"👥 Группы/чаты: <b>{groups_count}</b>\n"
+    kb = _user_action_kb(lang, user, "", groups_count=groups_count)
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 

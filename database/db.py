@@ -1,8 +1,70 @@
+import json
 import aiosqlite
+
+try:
+    import aiomysql
+except ImportError:  # Optional unless DB_TYPE=mysql
+    aiomysql = None
+
 from datetime import date, datetime
 from config import config
 
+
+class CompatRow(dict):
+    """Dict row that also supports row[0] like sqlite rows used in old code."""
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return super().__getitem__(key)
+
+
+class CompatCursor:
+    def __init__(self, lastrowid=None):
+        self.lastrowid = lastrowid
+
+
+class MySQLDB:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def _sql(self, sql: str) -> str:
+        sql = sql.replace("?", "%s")
+        sql = sql.replace("MAX(0, extra_downloads - 1)", "GREATEST(0, extra_downloads - 1)")
+        return sql
+
+    async def execute_fetchall(self, sql: str, params=()):
+        async with self.conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(self._sql(sql), params or ())
+            rows = await cur.fetchall()
+        return [CompatRow(r) for r in rows]
+
+    async def execute(self, sql: str, params=()):
+        async with self.conn.cursor() as cur:
+            await cur.execute(self._sql(sql), params or ())
+            return CompatCursor(cur.lastrowid)
+
+    async def commit(self):
+        await self.conn.commit()
+
+    async def close(self):
+        self.conn.close()
+
+
 async def get_db():
+    if config.DB_TYPE == "mysql":
+        if aiomysql is None:
+            raise RuntimeError("DB_TYPE=mysql requires: pip install aiomysql")
+        conn = await aiomysql.connect(
+            host=config.MYSQL_HOST,
+            port=config.MYSQL_PORT,
+            user=config.MYSQL_USER,
+            password=config.MYSQL_PASSWORD,
+            db=config.MYSQL_DATABASE,
+            charset=config.MYSQL_CHARSET,
+            autocommit=False,
+        )
+        return MySQLDB(conn)
+
     db = await aiosqlite.connect(config.DB_PATH)
     db.row_factory = aiosqlite.Row
     return db
@@ -75,15 +137,27 @@ async def record_download(user_id: int, url: str, platform: str, title: str = No
                     (user_id,)
                 )
 
-        # Update daily stats
-        await db.execute(
-            """INSERT INTO stats (date, total_downloads, by_platform)
-               VALUES (?, 1, ?)
-               ON CONFLICT(date) DO UPDATE SET
-               total_downloads = total_downloads + 1,
-               by_platform = json_set(by_platform, '$.' || ?, COALESCE(json_extract(by_platform, '$.' || ?), 0) + 1)""",
-            (today, f'{{"{platform}": 1}}', platform, platform)
+        # Update daily stats. Do it in Python so it works on both SQLite and MySQL.
+        stat_rows = await db.execute_fetchall(
+            "SELECT total_downloads, by_platform FROM stats WHERE date = ?",
+            (today,),
         )
+        if stat_rows:
+            stat = dict(stat_rows[0])
+            try:
+                by_platform = json.loads(stat.get("by_platform") or "{}")
+            except Exception:
+                by_platform = {}
+            by_platform[platform] = int(by_platform.get(platform, 0)) + 1
+            await db.execute(
+                "UPDATE stats SET total_downloads = total_downloads + 1, by_platform = ? WHERE date = ?",
+                (json.dumps(by_platform, ensure_ascii=False), today),
+            )
+        else:
+            await db.execute(
+                "INSERT INTO stats (date, total_downloads, by_platform) VALUES (?, 1, ?)",
+                (today, json.dumps({platform: 1}, ensure_ascii=False)),
+            )
         await db.commit()
     finally:
         await db.close()
@@ -216,11 +290,60 @@ async def get_daily_stats(days: int = 7):
     finally:
         await db.close()
 
+
+
+# ─── Stars payments tracking ────────────────────────────────
+async def record_payment(user_id: int, username: str = None, first_name: str = None,
+                         payload: str = None, item_type: str = None, quality: str = None,
+                         stars_amount: int = 0, currency: str = "XTR",
+                         telegram_payment_charge_id: str = None,
+                         provider_payment_charge_id: str = None) -> int:
+    """Store a successful Telegram Stars payment for admin audit/history."""
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            """INSERT INTO payments
+               (user_id, username, first_name, payload, item_type, quality,
+                stars_amount, currency, telegram_payment_charge_id,
+                provider_payment_charge_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, username, first_name, payload, item_type, quality,
+             stars_amount, currency, telegram_payment_charge_id,
+             provider_payment_charge_id),
+        )
+        await db.commit()
+        return cur.lastrowid
+    finally:
+        await db.close()
+
+
+async def get_recent_payments(limit: int = 20) -> list[dict]:
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            "SELECT * FROM payments ORDER BY created_at DESC LIMIT ?", (limit,)
+        )
+        return [dict(r) for r in rows]
+    finally:
+        await db.close()
+
+
+async def get_user_group_count(user_id: int) -> int:
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            "SELECT COUNT(*) FROM group_chats WHERE added_by = ? AND is_active = 1",
+            (user_id,),
+        )
+        return int(rows[0][0]) if rows else 0
+    finally:
+        await db.close()
+
 # ─── Bot settings (admin feature toggles) ───────────────────
 async def get_setting(key: str, default: str = "1") -> str:
     db = await get_db()
     try:
-        rows = await db.execute_fetchall("SELECT value FROM bot_settings WHERE key = ?", (key,))
+        rows = await db.execute_fetchall("SELECT value FROM bot_settings WHERE `key` = ?", (key,))
         return rows[0][0] if rows else default
     finally:
         await db.close()
@@ -228,7 +351,7 @@ async def get_setting(key: str, default: str = "1") -> str:
 async def get_all_settings() -> dict:
     db = await get_db()
     try:
-        rows = await db.execute_fetchall("SELECT key, value FROM bot_settings")
+        rows = await db.execute_fetchall("SELECT `key`, value FROM bot_settings")
         return {r[0]: r[1] for r in rows}
     finally:
         await db.close()
@@ -236,11 +359,18 @@ async def get_all_settings() -> dict:
 async def set_setting(key: str, value: str):
     db = await get_db()
     try:
-        await db.execute(
-            "INSERT INTO bot_settings (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = ?",
-            (key, value, value)
-        )
+        if config.DB_TYPE == "mysql":
+            await db.execute(
+                "INSERT INTO bot_settings (`key`, value) VALUES (?, ?) "
+                "ON DUPLICATE KEY UPDATE value = VALUES(value)",
+                (key, value),
+            )
+        else:
+            await db.execute(
+                "INSERT INTO bot_settings (`key`, value) VALUES (?, ?) "
+                "ON CONFLICT(`key`) DO UPDATE SET value = ?",
+                (key, value, value)
+            )
         await db.commit()
     finally:
         await db.close()
@@ -440,7 +570,7 @@ GROUP_FLAG_COLUMNS = {"show_tags", "show_source_channel", "delete_user_url"}
 
 
 async def ensure_group_chat(chat_id: int, title: str = None, chat_type: str = None,
-                            added_by: int = None) -> None:
+                            added_by: int = None, language: str = None) -> None:
     """Register (or refresh) a group/channel the bot lives in.
 
     New rows inherit the current global `group_download_mode` so behaviour is
@@ -458,28 +588,28 @@ async def ensure_group_chat(chat_id: int, title: str = None, chat_type: str = No
             if added_by is not None:
                 await db.execute(
                     "UPDATE group_chats SET title = COALESCE(?, title), "
-                    "chat_type = COALESCE(?, chat_type), added_by = ?, is_active = 1 "
-                    "WHERE chat_id = ?",
-                    (title, chat_type, added_by, chat_id),
+                    "chat_type = COALESCE(?, chat_type), language = COALESCE(?, language), "
+                    "added_by = ?, is_active = 1 WHERE chat_id = ?",
+                    (title, chat_type, language, added_by, chat_id),
                 )
             else:
                 await db.execute(
                     "UPDATE group_chats SET title = COALESCE(?, title), "
-                    "chat_type = COALESCE(?, chat_type), is_active = 1 "
-                    "WHERE chat_id = ?",
-                    (title, chat_type, chat_id),
+                    "chat_type = COALESCE(?, chat_type), language = COALESCE(?, language), "
+                    "is_active = 1 WHERE chat_id = ?",
+                    (title, chat_type, language, chat_id),
                 )
         else:
             default_mode = "ask"
             srow = await db.execute_fetchall(
-                "SELECT value FROM bot_settings WHERE key = 'group_download_mode'"
+                "SELECT value FROM bot_settings WHERE `key` = 'group_download_mode'"
             )
             if srow and srow[0][0] in VALID_DOWNLOAD_MODES:
                 default_mode = srow[0][0]
             await db.execute(
-                "INSERT INTO group_chats (chat_id, title, chat_type, added_by, "
-                "download_mode, is_active) VALUES (?, ?, ?, ?, ?, 1)",
-                (chat_id, title, chat_type, added_by, default_mode),
+                "INSERT INTO group_chats (chat_id, title, chat_type, language, added_by, "
+                "download_mode, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)",
+                (chat_id, title, chat_type, language or "en", added_by, default_mode),
             )
         await db.commit()
     finally:
@@ -502,15 +632,21 @@ def _group_row_to_settings(r: dict) -> dict:
     mode = r.get("download_mode") or "ask"
     if mode not in VALID_DOWNLOAD_MODES:
         mode = "ask"
+    cap_mode = r.get("caption_mode") or "src_via"
+    if cap_mode not in VALID_CAPTION_MODES:
+        cap_mode = "src_via"
     return {
         "chat_id": r["chat_id"],
         "title": r.get("title") or str(r["chat_id"]),
         "chat_type": r.get("chat_type"),
+        "language": r.get("language") or "en",
         "added_by": r.get("added_by"),
         "show_tags": bool(r.get("show_tags")),
         "show_source_channel": bool(r.get("show_source_channel")),
         "download_mode": mode,
         "delete_user_url": bool(r.get("delete_user_url")),
+        "caption_mode": cap_mode,
+        "description_mode": (r.get("description_mode") if r.get("description_mode") in VALID_DESCRIPTION_MODES else "off"),
         "is_active": bool(r.get("is_active")),
     }
 
@@ -599,6 +735,48 @@ async def set_group_download_mode(chat_id: int, mode: str) -> None:
     try:
         await db.execute(
             "UPDATE group_chats SET download_mode = ? WHERE chat_id = ?", (mode, chat_id)
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def set_group_language(chat_id: int, language: str) -> None:
+    """Set bot UI/message language for a specific group/chat."""
+    if not language:
+        language = "en"
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE group_chats SET language = ? WHERE chat_id = ?", (language, chat_id)
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def set_group_description_mode(chat_id: int, mode: str) -> None:
+    """Set how source description/text is delivered in a group/chat."""
+    if mode not in VALID_DESCRIPTION_MODES:
+        mode = "off"
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE group_chats SET description_mode = ? WHERE chat_id = ?", (mode, chat_id)
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def set_group_caption_mode(chat_id: int, mode: str) -> None:
+    """Set what the group/chat credit line shows (see VALID_CAPTION_MODES)."""
+    if mode not in VALID_CAPTION_MODES:
+        mode = "src_via"
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE group_chats SET caption_mode = ? WHERE chat_id = ?", (mode, chat_id)
         )
         await db.commit()
     finally:
